@@ -1,0 +1,31 @@
+\chapter{Porting in brief}
+\label{app:porting}
+
+The kernel never touches hardware. Everything it needs comes from
+\code{port/<arch>/port.h}, which every kernel file includes through \code{rtos.h}. A
+port is three or four files plus a make fragment: the AVR port is the smallest complete
+example, the host port shows the minimum that makes the kernel run at all, and the
+Xtensa port shows a CPU with register windows, a lazy FPU and a ROM loader.
+\code{porting.md} in nornDocs is the full description; in outline a port provides:
+
+\begin{enumerate}
+\item \textbf{Types and constants}: the tick, event and task mask types, the stack
+  sizes (\code{RTOS\_PORT\_MIN\_STACK}, \code{DEFAULT}, \code{LARGE}, \code{STACK\_WARN},
+  \code{STACK\_ALIGN}), the run time counter frequency.
+\item \textbf{Critical sections}: enter returns the previous interrupt state, exit
+  restores it.
+\item \textbf{The interrupt model}: the \code{RTOS\_ISR} macro and the interrupt tail
+  that switches once at the end of an ISR; the tick interrupt.
+\item \textbf{The context switch}: initialise a stack so that the first switch to it
+  enters the task trampoline; save the current context and restore another.
+\item \textbf{Time}: start the tick at \code{RTOS\_CFG\_TICK\_HZ}; a free running
+  microsecond source for \code{rtos\_getTimeUs}; the run time counter.
+\item \textbf{Robustness hooks}: halt, reset, the memory that survives a reset for the
+  panic record, the reset cause, the hardware watchdog.
+\item \textbf{The make fragment}: compiler, flags, the port's sources, how to upload and
+  how to simulate.
+\end{enumerate}
+
+Bringing a port up is done with tc01 first (the kernel's primitives on the new CPU) and
+tc10 last (its cost), and the port is accepted when the host unit tests' invariants hold
+on the target through tc01 to tc06.

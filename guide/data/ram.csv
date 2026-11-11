@@ -1,0 +1,9 @@
+object,mega2560,esp32
+tcb,42,72
+sem,4,4
+mutex,4,4
+queue,12,16
+mbox,7,12
+pool,12,20
+timer,18,28
+evgroup,3,4

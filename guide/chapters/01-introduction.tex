@@ -1,0 +1,118 @@
+\chapter{Introduction}
+\label{ch:intro}
+
+nornRTOS is a real time operating system for small microcontrollers. It consists of a
+kernel, \emph{nornCore}, a TCP/IP stack, \emph{nornNET}, and a driver for the ESP32's
+WiFi radio that runs without ESP-IDF or FreeRTOS, \emph{nornWIFI}. The kernel runs on the
+8\,bit AVR family (ATmega328P on the Arduino UNO, ATmega2560 on the Arduino Mega) and on
+the Xtensa LX6 of the ESP32; a host port runs the same kernel on Linux for testing. The
+whole system is written in C99 with a few dozen lines of assembler per port, and every
+piece of it is compiled from source together with the application and its configuration.
+
+This guide is for the engineer who writes an application on nornRTOS. It explains the
+model of the kernel (chapter~\ref{ch:concepts}), how an application is built and
+configured (chapters~\ref{ch:start} and~\ref{ch:config}), how the primitives are meant to
+be used (chapter~\ref{ch:primitives}) and what the kernel does when something goes wrong
+(chapter~\ref{ch:robust}). Chapter~\ref{ch:api} is the reference of the public API,
+chapter~\ref{ch:net} covers the network modules, and chapters~\ref{ch:perf}
+and~\ref{ch:verify} present the measurements and the test suite the figures in this guide
+rest on. The form of the guide follows the RTuinOS user guide~\cite{rtuinos}, the
+operating system nornRTOS grew out of and replaced.
+
+\section{What kind of kernel this is}
+
+nornCore is a \emph{static}, \emph{fixed priority}, \emph{preemptive} kernel with
+\emph{one task per priority}:
+
+\begin{itemize}
+\item \textbf{Static.} Every task is created in \code{main()} before the scheduler starts
+  and lives for ever. The kernel never allocates memory: the application owns every stack
+  and every synchronisation object. Nothing in the kernel grows at run time, so the
+  memory an application needs is known when it is linked.
+\item \textbf{Fixed priority, one task per priority.} A task's identifier \emph{is} its
+  priority, 1 to \code{RTOS\_CFG\_NUM\_TASKS}; 0 is the idle task. Two tasks never share
+  a priority, so there is no round robin, no time slice and no question about the order
+  in which equal tasks run. The theory behind fixed priority scheduling and its
+  schedulability tests is Liu and Layland's~\cite{liulayland} and its descendants, and
+  nornCore gives the application exactly the model that theory assumes.
+\item \textbf{Preemptive, $O(1)$.} The scheduler is one bit mask of ready tasks and one
+  highest-bit lookup: between four and twenty cycles depending on the CPU. A task that
+  becomes ready with a higher priority than the running one runs at once; a task that
+  blocks hands the CPU to the highest ready one. Every blocking call has a timeout.
+\item \textbf{Priority ceiling mutexes.} Mutual exclusion uses the immediate priority
+  ceiling protocol~\cite{shaetal,baker}: a task that locks a mutex runs at the mutex's
+  ceiling while it holds it, so with a correct ceiling nobody ever blocks on a mutex,
+  priority inversion is bounded by one critical section, and deadlock is impossible.
+\item \textbf{Measured.} The cost of every kernel call, the context switch, the interrupt
+  latency and the stack each task needs are measured in CPU cycles on the real boards and
+  in a cycle exact simulator, before and after every change to the kernel
+  (chapter~\ref{ch:perf}). A kernel of a few kilobytes has no excuse for unknown numbers.
+\end{itemize}
+
+What is deliberately absent is as telling: time slicing, dynamic creation and deletion of
+tasks at run time (the life cycle in section~\ref{sec:lifecycle} and
+appendix~\ref{app:roadmap} are the preparation), priority inheritance (the ceiling
+protocol is simpler and has better bounds) and symmetric multiprocessing (the two ESP32
+cores run two independent kernels joined by a message link instead).
+
+\section{The modules and the boards}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Module & What it is & Boards \\
+\midrule
+nornCore & the kernel, the ports, a small HAL (UART, GPIO, delay, trace) & UNO, Mega 2560, ESP32, host \\
+nornNET  & Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP client, DNS resolver & ESP32, Mega 2560 (SLIP), host \\
+nornWIFI & the ESP32 radio as a station, WPA2 personal, a nornNET device & ESP32 \\
+nornHTTP & an HTTP/1.1 client over any byte stream, no heap, streamed bodies & any, with a nornNET adapter \\
+\bottomrule
+\end{tabular}
+\caption{The modules of nornRTOS.}
+\end{table}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}llllll@{}}
+\toprule
+Board & CPU & Clock & RAM & Flash & Simulator \\
+\midrule
+Arduino UNO      & ATmega328P, 8 bit AVR     & 16 MHz  & 2 KB   & 32 KB   & simavr (cycle exact) \\
+Arduino Mega 2560 & ATmega2560, 8 bit AVR    & 16 MHz  & 8 KB   & 256 KB  & simavr (cycle exact) \\
+ESP32 devkit     & ESP32-D0WDQ6, 2 Xtensa LX6 & 240 MHz & 520 KB & 4 MB    & Espressif QEMU (not cycle exact) \\
+\bottomrule
+\end{tabular}
+\caption{The boards. The ESP32 runs bare metal: the ROM loads the image, no ESP-IDF.}
+\label{tab:boards}
+\end{table}
+
+The UNO has room for the kernel and a small application; nornNET runs on the Mega over
+a serial line and on the ESP32 over Ethernet (QEMU) or WiFi (nornWIFI). Everything in this
+guide that gives a number says which board it was measured on.
+
+\section{Conventions}
+
+\begin{description}
+\item[Checked] means a mandatory check, \code{RTOS\_CHECK}, compiled into every
+  configuration. A violation stops the system with \code{RTOS\_PANIC\_ARGUMENT} and a
+  record naming the values. Task ids, NULL storage, stacks below the minimum, timeouts
+  above the limit and foreign blocks freed are checked.
+\item[Asserted] means \code{RTOS\_ASSERT}, compiled only with \code{RTOS\_CFG\_ASSERT}.
+  Without it a broken asserted contract is undefined behaviour. Recursive locks, unlock
+  order and empty event masks are asserted.
+\item[Task context] is a task function or anything it calls. \textbf{ISR body} is the
+  code inside \code{RTOS\_ISR}, a software timer callback running in the tick, or the
+  trace hook. The \textbf{idle task} is the context of \code{main()} after
+  \code{rtos\_start()} and of the idle hook. Which functions each context may call is
+  the subject of section~\ref{sec:contexts}.
+\item[Ticks] are the kernel's unit of time, \code{RTOS\_CFG\_TICK\_HZ} per second
+  (1\,kHz in every configuration shipped). \code{RTOS\_MS(ms)} converts milliseconds.
+\item[Cycles] are CPU clock cycles: 62.5\,ns on the 16\,MHz AVR, 4.17\,ns on the
+  240\,MHz ESP32. Most figures are in cycles because that is what the benchmark measures
+  and what does not change with the clock.
+\end{description}
+
+Function names are written as in the header: \code{rtos\_semGive}. A function with the
+suffix \code{FromIsr} is the variant for an ISR body. Names from the configuration start
+with \code{RTOS\_CFG\_}.

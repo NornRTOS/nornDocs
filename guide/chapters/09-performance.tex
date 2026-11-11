@@ -1,0 +1,289 @@
+\chapter{Performance}
+\label{ch:perf}
+
+Every figure in this chapter was produced by the test applications tc10, tc11 and tc12
+of nornCore, run by \code{tools/measure.sh} on the Arduino Mega 2560 (16\,MHz) and the
+ESP32 board (240\,MHz) and written to \code{doc/measurements/\measLabel.md} on
+\measDate. The graphs are generated from that summary; a new measurement regenerates
+them (\code{make data} in nornDocs). The same script records the ESP32 in QEMU, which is
+not cycle accurate and is omitted here except where stack use is concerned, for which it
+is exact.
+
+\section{Method}
+
+\paragraph{tc10} measures the kernel in CPU cycles with a cycle counter (a free running
+timer at $F_{CPU}$ on the Mega, \code{CCOUNT} on the ESP32) and a probe interrupt whose
+period is dithered so that it lands at every phase of the tick and of the other
+activity. Everything in the test runs at once: the switch benchmark, the probe at about
+770\,Hz, the tick, and the default configuration (stack fill, run time statistics,
+assertions, software timers). Three kinds of figures come out:
+
+\begin{itemize}
+\item \textbf{API cost}: one call pair (give and take, lock and unlock, send and
+  receive) on a single task with nobody waiting, so no switch happens. The minimum of
+  64 repetitions: the cost of the critical section and the bookkeeping.
+\item \textbf{Switch}: a low task signals a high one, which blocks again at once. Per
+  switch, including the signalling call, minimum and average over 500 round trips. This
+  is the number that matters for a design: how much a wake-up costs.
+\item \textbf{Interrupt}: the entry latency from the hardware event to the first
+  instruction of the \code{RTOS\_ISR} body, and the latency from a give in the ISR body
+  to the first instruction of the woken task (``ISR to task''), minimum, average and
+  maximum over a thousand probes landing at random phases.
+\end{itemize}
+
+simavr is cycle exact and gives the same numbers as the Mega board (the ISR to task
+minimum is one lucky probe and may differ by a few cycles between the two), so a
+simulator run of tc10 is the arbiter for an A/B comparison of two kernel variants.
+
+\paragraph{tc11} measures the stack a task needs for the kernel's and the port's sake:
+tasks that do one thing each (only block, be woken from an interrupt, be interrupted
+while running, run the benchmark script) report their high water marks. \textbf{tc12}
+repeats this at the bottom of a call chain 0, 4, 8, 16 and 32 frames deep, in four
+phases.
+
+\section{The cost of a call}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornbar, ylabel={cycles, one call pair},
+  xticklabels from table={\apitable}{call}, legend entries={Mega 2560, ESP32}]
+\addplot[fill=nornblue!70, draw=nornblue] table[x expr=\coordindex, y=mega2560] {\apitable};
+\addplot[fill=nornred!60, draw=nornred] table[x expr=\coordindex, y=esp32] {\apitable};
+\end{axis}
+\end{tikzpicture}
+\caption{API cost in cycles for one call pair without a switch (tc10, \measDate). The
+AVR is an 8 bit machine; its cycle counts are higher but its cycle is 15 times longer,
+so a semaphore pair costs 9\,$\mu$s on the Mega and 0.47\,$\mu$s on the ESP32.
+\code{getStackFree} (1694 / 6438 cycles, the scan of a whole stack) is left out of the
+graph.}
+\label{fig:api}
+\end{figure}
+
+Figure~\ref{fig:api} ranks the primitives. The semaphore and the event flags are the
+cheapest signals, the notification follows, the mutex costs a priority change on top of
+the bookkeeping, the queue copies the item twice, and the pool pays for the pointer
+alignment through \code{memcpy} on the AVR. \code{getCpuLoad} on the AVR is a 32 bit
+division; \code{getTimeUs} on the ESP32 is a division of the cycle counter. ``Ceiling
+held'' repeats the semaphore pair while the running task holds a mutex with a ceiling
+above its priority: the scheduler then has to consider the boosted mask, and the
+difference (8 cycles on the Mega, 3 on the ESP32) is the whole price of the ceiling
+protocol on the hot path.
+
+\section{The context switch}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornbar, ylabel={cycles per switch}, bar width=8pt,
+  xticklabels from table={\switchtable}{mechanism},
+  legend entries={Mega min, Mega avg, ESP32 min, ESP32 avg}, legend columns=2]
+\addplot[fill=nornblue!80, draw=nornblue] table[x expr=\coordindex, y=megamin] {\switchtable};
+\addplot[fill=nornblue!35, draw=nornblue] table[x expr=\coordindex, y=megaavg] {\switchtable};
+\addplot[fill=nornred!70, draw=nornred] table[x expr=\coordindex, y=espmin] {\switchtable};
+\addplot[fill=nornred!30, draw=nornred] table[x expr=\coordindex, y=espavg] {\switchtable};
+\end{axis}
+\end{tikzpicture}
+\caption{Cycles per context switch including the signalling call, by mechanism
+(tc10, \measDate): 27.4\,$\mu$s on the Mega and 1.70\,$\mu$s on the ESP32 for the
+semaphore. The average exceeds the minimum on the Mega because the tick and the probe
+interrupt land inside some of the 500 round trips.}
+\label{fig:switch}
+\end{figure}
+
+Where the cycles go on the AVR, per switch: about 105 in the context switch itself (19
+registers each way), about 45 in the run time statistics, about 20 in the assertions,
+the rest in the scheduler, the wait list and the primitive. With statistics and
+assertions off the switch is 322 cycles (20\,$\mu$s); table~\ref{tab:threecfg} has the
+three configurations. On the ESP32 a switch spills every live register window and the
+blocking path costs what a whole AVR stack does; with statistics off it is 361 cycles,
+with assertions off as well 351 (1.46\,$\mu$s).
+
+\section{Interrupt latency}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornbar, ylabel={cycles, ISR body to task}, bar width=8pt, enlarge x limits=0.25,
+  xticklabels from table={\isrtable}{path},
+  legend entries={Mega min, Mega avg, Mega max, ESP32 min, ESP32 avg, ESP32 max}, legend columns=3]
+\addplot[fill=nornblue!90, draw=nornblue] table[x expr=\coordindex, y=megamin] {\isrtable};
+\addplot[fill=nornblue!55, draw=nornblue] table[x expr=\coordindex, y=megaavg] {\isrtable};
+\addplot[fill=nornblue!20, draw=nornblue] table[x expr=\coordindex, y=megamax] {\isrtable};
+\addplot[fill=nornred!90, draw=nornred] table[x expr=\coordindex, y=espmin] {\isrtable};
+\addplot[fill=nornred!55, draw=nornred] table[x expr=\coordindex, y=espavg] {\isrtable};
+\addplot[fill=nornred!20, draw=nornred] table[x expr=\coordindex, y=espmax] {\isrtable};
+\end{axis}
+\end{tikzpicture}
+\caption{Latency from a give in the ISR body to the first instruction of the woken task,
+minimum, average and maximum over 1000 probes at random phases (tc10, \measDate). The
+maximum is the longest interrupt-off window: a context switch that the probe lands
+behind.}
+\label{fig:isr}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{Mega 2560} & \multicolumn{2}{c}{ESP32} \\
+ & cycles & time & cycles & time \\
+\midrule
+interrupt entry, min / avg / max         & 50 / 65 / 548 & 3.1 / 4.1 / 34 $\mu$s & -- / 35 / 106 & -- / 0.9 / 2.7 $\mu$s \\
+ISR to task (semaphore), min / max       & 471 / 826 & 29.4 / 51.6 $\mu$s & 418 / 765 & 1.74 / 3.19 $\mu$s \\
+hardware event to task, best case        & & 33.5 $\mu$s & & 1.85 $\mu$s \\
+\bottomrule
+\end{tabular}
+\caption{Interrupt figures (tc10, \measDate). The ESP32 entry minimum reads 0 because the
+probe timer's 40\,MHz counter is latched at the alarm. The entry cost on the ESP32 is
+the same 850\,ns whether the interrupted task is 0 or 32 call frames deep (tc12): the
+window spill at entry depends on the live windows, at most about seven, not on the
+depth.}
+\label{tab:isr}
+\end{table}
+
+The AVR entry maximum of 34\,$\mu$s and the ISR to task maximum of 52\,$\mu$s are the
+same phenomenon: a 27\,$\mu$s switch with interrupts off that the probe lands behind,
+plus a tick with a wake-up. Interrupts do not nest, so these maxima are also the worst
+case for any other interrupt in the system.
+
+\section{Memory}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornbar, ylabel={bytes}, bar width=8pt,
+  xticklabels from table={\ramtable}{object}, legend entries={Mega 2560, ESP32}]
+\addplot[fill=nornblue!70, draw=nornblue] table[x expr=\coordindex, y=mega2560] {\ramtable};
+\addplot[fill=nornred!60, draw=nornred] table[x expr=\coordindex, y=esp32] {\ramtable};
+\end{axis}
+\end{tikzpicture}
+\caption{RAM per kernel object in the default configuration (tc10, \measDate). The TCB
+is per task; the pointer width (2 and 4 bytes) explains most of the difference.}
+\label{fig:ram}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{image (tc01)} & \multicolumn{3}{c}{every kernel and port function} \\
+Board & text & data & bss & text & data & bss \\
+\midrule
+uno       & 6852  & 170 & 833  & 9909  & 8  & 240 \\
+mega2560  & 6998  & 170 & 833  & 9935  & 8  & 240 \\
+esp32     & 10138 & 24  & 3920 & 12975 & 13 & 815 \\
+\bottomrule
+\end{tabular}
+\caption{Code and data size in bytes (\measLabel). The image is tc01 with its default
+configuration, after the linker dropped what it does not call; the right half is every
+kernel and port object compiled, the upper bound an application can pull in. The
+smallest running application, one task blinking the LED with everything off, is 2514
+bytes of text on the UNO and 6089 on the ESP32.}
+\label{tab:size}
+\end{table}
+
+\section{Stacks}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornbar, ylabel={bytes used}, bar width=10pt, enlarge x limits=0.2,
+  xticklabels from table={\stackeleventable}{task}, legend entries={Mega 2560, ESP32}]
+\addplot[fill=nornblue!70, draw=nornblue] table[x expr=\coordindex, y=mega2560] {\stackeleventable};
+\addplot[fill=nornred!60, draw=nornred] table[x expr=\coordindex, y=esp32] {\stackeleventable};
+\end{axis}
+\end{tikzpicture}
+\caption{Stack used by tasks that do one thing each (tc11, \measDate): \emph{block} only
+blocks, \emph{wake} is woken from an interrupt, \emph{busy} is interrupted while
+running, \emph{script} runs the test's own sequence. The ESP32 ``block'' figure is 192
+when no interrupt lands on the task during its short runs and 300 when one does: size a
+stack by the interrupted figure, which does not depend on luck.}
+\label{fig:stack11}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornline, width=0.49\linewidth, height=6cm, xlabel={call depth (frames)},
+  ylabel={bytes used}, title={Mega 2560}, xticklabels from table={\stackmegatable}{depth},
+  legend entries={A chain alone, B preempted, C blocking, D float preempted}, legend style={font=\scriptsize}]
+\addplot[mark=*, gray] table[x expr=\coordindex, y=A] {\stackmegatable};
+\addplot[mark=square*, nornblue] table[x expr=\coordindex, y=B] {\stackmegatable};
+\addplot[mark=triangle*, nornblue!50] table[x expr=\coordindex, y=C] {\stackmegatable};
+\addplot[mark=diamond*, nornred] table[x expr=\coordindex, y=D] {\stackmegatable};
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[nornline, width=0.49\linewidth, height=6cm, xlabel={call depth (frames)},
+  ylabel={bytes used}, title={ESP32}, xticklabels from table={\stackesptable}{depth},
+  legend entries={A chain alone, B preempted, C blocking, D float preempted}, legend style={font=\scriptsize}]
+\addplot[mark=*, gray] table[x expr=\coordindex, y=A] {\stackesptable};
+\addplot[mark=square*, nornblue] table[x expr=\coordindex, y=B] {\stackesptable};
+\addplot[mark=triangle*, nornblue!50] table[x expr=\coordindex, y=C] {\stackesptable};
+\addplot[mark=diamond*, nornred] table[x expr=\coordindex, y=D] {\stackesptable};
+\end{axis}
+\end{tikzpicture}
+\caption{Stack used against call depth (tc12, \measDate): the chain alone, preempted at
+the bottom with a switch out of the interrupt, blocking at the bottom, and floating point
+at the bottom. The lines are parallel: the kernel's and the port's share is constant
+(Mega 59 / 48 / 65 bytes, ESP32 368 / 300 / 368 including the task's two bottom
+frames), so the rule for a stack is the task's own frames (12 bytes per level on the
+Mega with a few locals, 32 per \code{call8} level on the ESP32) plus the
+``interrupted'' figure.}
+\label{fig:stack12}
+\end{figure}
+
+\section{The cost of the configuration}
+
+Table~\ref{tab:threecfg} gives the switch for the three configurations: on the Mega the
+run time statistics cost about 45 cycles per switch and the assertions about 20; on the
+ESP32 the lean kernel saves 93 cycles over the default. \code{RTOS\_CFG\_STACK\_CHECK}
+costs nothing on the hot path (the fill is at creation, the canary check a compare per
+switch), the software timers one list check per tick, and the ceiling protocol 8 cycles
+on the Mega only while a boosting mutex is held.
+
+\section{History}
+
+nornCore measures itself before and after every change to the kernel. Figure~\ref{fig:history}
+shows the hot path and the code size across the steps since the baseline of
+2026-11-05: the fixes of an independent audit (F1 to F11), the scheduler contract for
+mutex ceilings (tie), the exclusion of the running task's own boost from the slow path
+test (boost) and the task life cycle (lifecycle). Correctness bought about 13 cycles per
+switch on the Mega (F2: the scheduler now honours every task's effective priority, not
+only the running one's) and about 550 bytes of flash; the later steps are flat.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[nornline, height=5.5cm, ylabel={cycles}, xticklabels from table={\historytable}{step},
+  legend entries={Mega switch, Mega ISR to task, ESP32 switch, ESP32 ISR to task}, legend columns=2,
+  legend style={at={(0.5,-0.42)}, anchor=north}]
+\addplot[mark=*, nornblue] table[x=n, y=megaswitch] {\historytable};
+\addplot[mark=square*, nornblue!50] table[x=n, y=megaisr] {\historytable};
+\addplot[mark=*, nornred] table[x=n, y=espswitch] {\historytable};
+\addplot[mark=square*, nornred!50] table[x=n, y=espisr] {\historytable};
+\end{axis}
+\end{tikzpicture}
+
+\vspace{1em}
+\begin{tikzpicture}
+\begin{axis}[nornline, height=5.5cm, ylabel={text, bytes (tc01)}, xticklabels from table={\historytable}{step},
+  legend entries={uno, mega2560, esp32}, legend columns=3, legend style={at={(0.5,-0.42)}, anchor=north}]
+\addplot[mark=*, gray] table[x=n, y=unotext] {\historytable};
+\addplot[mark=*, nornblue] table[x=n, y=megatext] {\historytable};
+\addplot[mark=*, nornred] table[x=n, y=esptext] {\historytable};
+\end{axis}
+\end{tikzpicture}
+\caption{The hot path (semaphore switch and ISR to task minimum) and the image size
+across the measured steps in \code{doc/measurements/}.}
+\label{fig:history}
+\end{figure}
+
+\section{The older timing test}
+
+tc04 measures with a 4\,$\mu$s counter and runs on every board including the UNO; it is
+coarser but confirms the picture: 24\,$\mu$s per switch and 24\,$\mu$s worst interrupt
+latency on both AVR boards, 1.7\,$\mu$s and 2\,$\mu$s on the ESP32 at 240\,MHz (10.9 and
+12\,$\mu$s at the 40\,MHz crystal clock before the PLL is enabled), with a periodic jitter
+of 16\,$\mu$s on the AVR and none the counter can see on the ESP32.

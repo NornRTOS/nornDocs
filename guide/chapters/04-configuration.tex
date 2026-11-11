@@ -1,0 +1,107 @@
+\chapter{Configuration}
+\label{ch:config}
+
+The kernel is configured at compile time by \code{rtos\_config.h} in the application
+directory, started from \code{config/rtos\_config.template.h}. Every option has a
+default (in \code{rtos\_types.h}) so a configuration lists only what differs, with one
+exception: \code{RTOS\_CFG\_NUM\_TASKS} must be given.
+
+\section{The options}
+
+\begin{small}
+\begin{longtable}{@{}lp{1.5cm}p{9.0cm}@{}}
+\caption{The configuration options, all prefixed \code{RTOS\_CFG\_}.}
+\label{tab:options}\\
+\toprule
+Option & Default & Meaning \\
+\midrule
+\endfirsthead
+\toprule
+Option & Default & Meaning \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\code{NUM\_TASKS}     & --      & application tasks, 1 to 31; the idle task is not counted; each gets the priority equal to its id \\
+\code{TICK\_HZ}       & 1000    & tick frequency; on the AVR it must divide $F_{CPU}/64$ exactly (1000 and 500 work at 16 MHz) \\
+\code{TICK\_BITS}     & 32      & width of the tick counter, 16 or 32; 16 saves RAM on the UNO and limits timeouts to 32.7 s \\
+\code{EVT\_BITS}      & 16      & width of the per task event flags, 8, 16 or 32; nornWIFI needs 32 \\
+\code{TIMER}          & arch    & AVR only: which 16 bit timer drives the tick (Mega: 1, 3, 4, 5; UNO: 1) \\
+\code{STACK\_CHECK}   & 1       & 1 fills stacks and supports \code{rtos\_getStackFree}; 2 adds the canary; 0 drops the bookkeeping \\
+\code{STACK\_WARN}    & 1       & the stack monitor in the idle task and \code{rtos\_stackWarnHook}; needs \code{STACK\_CHECK} \\
+\code{IDLE\_SLEEP}    & 1       & the idle task sleeps between interrupts \\
+\code{SW\_TIMERS}     & 1       & software timers; one list check per tick \\
+\code{RUNTIME\_STATS} & 1       & run time per task and CPU load, measured at every switch; about 45 cycles per switch on the AVR, 4 bytes per task \\
+\code{ASSERT}         & 1       & kernel assertions; about 20 cycles per switch on the AVR \\
+\code{IDLE\_HOOK}     & --      & a function called in every idle loop; the weak \code{rtos\_idleHook} is the usual way \\
+\code{PANIC\_ACTION}  & 0       & 0 halts at a panic (development), 1 resets with the record kept for \code{rtos\_getLastPanic} \\
+\code{WATCHDOG}       & 0       & hardware watchdog kicked by the idle task plus per task check-ins \\
+\code{AVR\_RESET\_VIA\_WDT} & 0 & AVR: reset through the watchdog (needs a bootloader that disables it) or by jumping to the reset vector \\
+\code{TIMER\_TASK\_PRIO} & 0    & 0 runs timer callbacks in the tick interrupt; a priority runs them in a kernel task of that priority (\code{TIMER\_TASK\_STACK} sizes it) \\
+\code{TRACE}          & 0       & call \code{rtos\_traceHook} at switches, blocks, wake-ups, timers and panics \\
+\code{EVGROUPS}       & 1       & event groups \\
+\code{NOTIFY}         & 1       & task notifications; 0 saves 2 bytes per task \\
+\code{SUSPEND}        & 1       & \code{rtos\_suspend} and \code{rtos\_resume} \\
+\code{HEAP}           & 0       & the first fit heap \\
+\code{TICKLESS}       & 0       & ESP32: the idle task stops the tick and sleeps until the next deadline \\
+\end{longtable}
+\end{small}
+
+\section{Three configurations to start from}
+
+The three sets in table~\ref{tab:threecfg} are measured starting points. \emph{small} is
+the lean kernel for the UNO or for the smallest possible footprint; \emph{default} is an
+ordinary application, and what nornWIFI needs on the ESP32; \emph{large} turns on
+everything for development and diagnosis.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Option & small & default & large \\
+\midrule
+\code{NUM\_TASKS} esp32 / mega / uno & 7 / 4 / 3 & 15 / 7 / 4 & 31 / 7 / -- \\
+\code{TICK\_BITS} esp32 / avr        & 32 / 16   & 32 / 32 (uno 16) & 32 / 32 \\
+\code{EVT\_BITS} esp32 / avr         & 16 / 8    & 32 / 16 (uno 8)  & 32 / 16 \\
+\code{STACK\_CHECK}                  & 1         & 2 (canary)       & 2 \\
+\code{STACK\_WARN}                   & 0         & 1                & 1 \\
+\code{RUNTIME\_STATS}                & 0         & 1                & 1 \\
+\code{ASSERT}                        & 0         & 1                & 1 \\
+\code{EVGROUPS}, \code{SUSPEND}      & 0         & 1 (uno 0)        & 1 \\
+\code{HEAP}, \code{WATCHDOG}         & 0         & esp32 1, avr 0   & esp32 1, avr 0 \\
+\code{TRACE}                         & 0         & 0                & 1 \\
+\code{TICKLESS} (esp32)              & 0         & 0                & 1 \\
+\code{SW\_TIMERS}, \code{NOTIFY}     & 1 (uno: timers 0) & 1        & 1 \\
+\midrule
+switch, cycles, esp32 / mega         & 347 / 315 & 440 / 472        & 472 / -- \\
+\bottomrule
+\end{tabular}
+\caption{Three configurations and their measured context switch (tc10, per switch
+including the signalling). Common to all: \code{TICK\_HZ} 1000, \code{IDLE\_SLEEP} 1,
+\code{TIMER\_TASK\_PRIO} 0, \code{PANIC\_ACTION} 0.}
+\label{tab:threecfg}
+\end{table}
+
+Two constraints from the hardware: the original Mega 2560 bootloader does not survive a
+watchdog reset, so the watchdog stays off on the AVR boards unless the bootloader is
+replaced; and nornWIFI needs the heap, event groups and 32 event bits.
+
+\section{The configuration signature}
+
+\code{rtos\_init} is a macro that passes \code{RTOS\_CONFIG\_SIGNATURE}, every layout
+changing option folded into one 32 bit number, to the kernel. An application compiled
+against another \code{rtos\_config.h} than the kernel objects it is linked with (a stale
+build directory, a library) panics with \code{RTOS\_PANIC\_CONFIG} at the first call,
+before any TCB is touched; the record carries both signatures.
+
+\section{A priority map}
+
+Priorities are unique and the module tasks need to be above every task that uses them.
+A map that works with the default configuration on the ESP32 (15 tasks): the nornWIFI
+radio task at 15 and its service task at 14, the nornNET net task at 13, the
+application's tasks from 1 to 12, with the most time critical highest. With the timer
+task enabled (\code{TIMER\_TASK\_PRIO}) its slot must be left free by the application.
+Period and deadline, not importance, should set the order among the application's
+tasks: rate monotonic assignment is optimal for independent periodic tasks under fixed
+priorities~\cite{liulayland}, and the ceiling protocol keeps the blocking term small
+enough for the usual response time analysis~\cite{burnswellings} to apply.

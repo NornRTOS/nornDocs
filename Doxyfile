@@ -1,0 +1,21 @@
+# make api  (or: NORNRTOS=../nornRTOS doxygen Doxyfile)  ->  api/html/index.html
+# The sources are read from the nornRTOS tree next to this repository; NORNRTOS points
+# elsewhere if the checkout is elsewhere.
+PROJECT_NAME           = nornRTOS
+PROJECT_BRIEF          = "A real time operating system for small microcontrollers"
+OUTPUT_DIRECTORY       = api
+INPUT                  = README.md design.md porting.md \
+                         $(NORNRTOS)/modules/nornCore/kernel/rtos.h \
+                         $(NORNRTOS)/modules/nornCore/kernel/rtos_types.h \
+                         $(NORNRTOS)/modules/nornCore/hal \
+                         $(NORNRTOS)/modules/nornHTTP/include \
+                         $(NORNRTOS)/modules/nornHTTP/adapters/norn_net_transport.h
+FILE_PATTERNS          = *.h *.md
+RECURSIVE              = NO
+USE_MDFILE_AS_MAINPAGE = README.md
+EXTRACT_ALL            = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+JAVADOC_AUTOBRIEF      = YES
+GENERATE_LATEX         = NO
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO

@@ -1,0 +1,215 @@
+\chapter{Networking: nornNET, nornWIFI and nornHTTP}
+\label{ch:net}
+
+The network modules are separate repositories with their own READMEs and plans; this
+chapter is what an application writer needs to use them from nornRTOS. The design
+sketch, protocol scope and test record are in \code{nornNET/doc/plan.md},
+\code{nornWIFI/doc/plan.md} and \code{nornHTTP/docs/} (contracts, measurements, plan).
+
+\section{nornNET}
+
+nornNET is a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, TCP (RFC 9293 with slow
+start, fast retransmit, delayed ACK, Nagle, zero window probing and out of order
+storage), a DHCP client and a DNS resolver, loosely modelled on microps~\cite{microps} in
+structure. Packet buffers are fixed size blocks from a pool, owned by whoever holds the
+pointer; there is one net task, one re-entrant lock, and no heap in the data path. It is
+verified against the Linux kernel as the peer, over a TAP device, QEMU's user mode
+network and a serial line (SLIP) on the ESP32 board, and it runs on the Mega 2560 over
+SLIP at the line rate.
+
+\subsection{Attaching it to an application}
+
+In \code{app.mk}:
+\begin{lstlisting}[language={}]
+NORNNET_DIR = /path/to/nornNET
+MODULES    += $(NORNNET_DIR)/nornnet.mk
+\end{lstlisting}
+and an \code{nn\_config.h} next to the application with at least
+\code{NN\_CFG\_TASK\_PRIO}, the net task's priority, above every task that uses the
+stack. Every \code{NN\_CFG\_*} option and its default is in \code{nn/nn\_cfg.h}. In
+\code{main}, after \code{rtos\_init}: \code{nn\_init()}, register the devices, add the
+interfaces with \code{nn\_ifaceAdd} (with an address, or empty and \code{nn\_dhcpStart}
+from a task), then \code{rtos\_start()}.
+
+\subsection{Sockets}
+
+Sockets are caller owned objects; for TCP the caller also owns the send and receive
+rings. Each call is either blocking with a timeout, from a task, or a callback that runs
+in the net task. The lock is re-entrant for the net task, so a callback may call the
+socket API.
+
+\begin{lstlisting}
+nn_err_t nn_udpOpen(nn_udp_t *pSock);
+nn_err_t nn_udpBind(nn_udp_t *pSock, nn_ip4_t addr, uint16_t port);
+nn_err_t nn_udpConnect(nn_udp_t *pSock, nn_ip4_t addr, uint16_t port);
+nn_err_t nn_udpSendTo(nn_udp_t *pSock, const void *p, size_t n, nn_ip4_t to, uint16_t port);
+nn_err_t nn_udpSend(nn_udp_t *pSock, const void *p, size_t n);
+int32_t  nn_udpRecvFrom(nn_udp_t *pSock, void *p, size_t n, nn_ip4_t *pFrom,
+                        uint16_t *pPort, nn_ms_t timeout);
+void     nn_udpOnReadable(nn_udp_t *pSock, nn_udpReadableFunc_t fn, void *arg);
+nn_err_t nn_udpClose(nn_udp_t *pSock);
+
+nn_err_t nn_tcpOpen(nn_tcp_t *pSock, void *pRxRing, uint16_t rxSize, void *pTxRing, uint16_t txSize);
+nn_err_t nn_tcpBind(nn_tcp_t *pSock, nn_ip4_t addr, uint16_t port);
+nn_err_t nn_tcpListen(nn_tcp_t *pSock);
+nn_err_t nn_tcpAccept(nn_tcp_t *pListen, nn_tcp_t *pNew, nn_ms_t timeout);
+nn_err_t nn_tcpConnect(nn_tcp_t *pSock, nn_ip4_t addr, uint16_t port, nn_ms_t timeout);
+int32_t  nn_tcpSend(nn_tcp_t *pSock, const void *p, size_t n, nn_ms_t timeout);
+int32_t  nn_tcpRecv(nn_tcp_t *pSock, void *p, size_t n, nn_ms_t timeout);
+nn_err_t nn_tcpClose(nn_tcp_t *pSock);
+nn_err_t nn_tcpAbort(nn_tcp_t *pSock);
+void     nn_tcpOnEvent(nn_tcp_t *pSock, nn_tcpEventFunc_t fn, void *arg);
+
+nn_err_t nn_dhcpStart(nn_dhcp_t *pD, nn_iface_t *pIf, nn_dhcpChangeFunc_t fn, void *arg);
+nn_err_t nn_dnsResolve(const char *name, nn_ip4_t *pAddr, nn_ms_t timeout);
+\end{lstlisting}
+
+Errors are negative \code{nn\_err\_t} values: \code{NN\_ERR\_NOMEM} (no buffer),
+\code{NN\_ERR\_TIMEOUT}, \code{NN\_ERR\_DOWN} (the device or the address is gone),
+\code{NN\_ERR\_RESET}, \code{NN\_ERR\_REFUSED}, \code{NN\_ERR\_CLOSED},
+\code{NN\_ERR\_PENDING} (a non-blocking call accepted) among them. Timeouts in nornNET
+are milliseconds (\code{nn\_ms\_t}).
+
+\subsection{Links that come and go}
+
+A driver whose carrier can disappear (WiFi, a cable) reports it with
+\code{nn\_netdevLinkChanged(dev, up)} from any context. On a loss the net task drops
+the device's ARP entries; on a return every DHCP client on the device confirms its lease
+at once, keeping the address meanwhile, so an outage on the same network does not
+disturb TCP connections. When an interface's address changes or goes, the TCP connections
+bound to the old one end with \code{NN\_ERR\_DOWN}.
+
+\section{nornWIFI}
+
+Espressif ships the ESP32 radio as binary libraries written against a table of operating
+system functions. nornWIFI implements that table over the nornCore primitives, adds the
+chip glue (power domain, clocks, PHY calibration, interrupts), the WPA supplicant for
+WPA2 personal, and a nornNET device. The result is a station that scans, joins, gets an
+address by DHCP and carries TCP at 400 to 650\,kB/s each way, with nornCore as the only
+kernel in the image.
+
+\subsection{Using it}
+
+\code{app.mk} adds both modules; \code{rtos\_config.h} needs \code{RTOS\_CFG\_HEAP 1},
+\code{RTOS\_CFG\_EVT\_BITS 32}, \code{RTOS\_CFG\_EVGROUPS 1} and two spare task ids at
+the top (\code{NW\_CFG\_TASK\_WIFI}, \code{NW\_CFG\_TASK\_SERVICE}; by default the two
+highest). Then:
+
+\begin{lstlisting}
+nw_init(NW_HEAP_SPARE_START, NW_HEAP_SPARE_SIZE);    /* in main, before rtos_start */
+...
+nw_start();                                            /* in a task */
+nn_ifaceAdd(nw_netdev(), &iface, zero, zero, zero);
+nw_connect("ssid", "password", 20000);                 /* or nw_connectStart + events */
+nn_dhcpStart(&dhcp, &iface, onDhcp, NULL);
+\end{lstlisting}
+
+From then on the station keeps the link up by itself (\code{NW\_CFG\_RECONNECT}: straight
+back after a loss, then a delay doubling from 1 to 60 seconds) until
+\code{nw\_disconnect}, and nornNET follows the link as described above.
+\code{nw\_linkState}, \code{nw\_rssi}, \code{nw\_isConnected} and the events delivered
+through \code{nw\_onEvent} (run in the service task, which must not call nornNET) tell
+what happens. Measured on the board: three forced drops recover in about 160\,ms, with
+DHCP confirmed within 100\,ms and a TCP connection intact.
+
+\begin{lstlisting}
+void      nw_init(void *heap, size_t heapSize);
+esp_err_t nw_start(void);
+esp_err_t nw_scan(wifi_ap_record_t *pRecords, uint16_t *pCount, uint32_t timeoutMs);
+esp_err_t nw_connect(const char *ssid, const char *password, uint32_t timeoutMs);
+esp_err_t nw_connectStart(const char *ssid, const char *password);
+esp_err_t nw_disconnect(void);
+bool      nw_isConnected(void);
+uint8_t   nw_linkState(void);
+int8_t    nw_rssi(void);
+struct nn_netdev *nw_netdev(void);
+void      nw_onEvent(nw_eventFunc_t cb, void *arg);
+void      nw_getStats(nw_stats_t *pStats);
+\end{lstlisting}
+
+The radio libraries are Espressif's and keep their Apache~2.0 licence; the supplicant is
+the upstream wpa\_supplicant as ported by Espressif (BSD). Both are listed in the
+repository's \code{THIRD\_PARTY\_LICENSES.md}.
+
+\section{nornHTTP}
+\label{sec:nornhttp}
+
+nornHTTP is an HTTP/1.1 client in portable C99 with nothing underneath it: no heap, no
+global state, no recursion, no dependency on nornCore or nornNET. The application owns
+every buffer and every context, so they can be static, and the library talks to the
+network through three functions it is handed (send, receive, a millisecond clock). An
+adapter for a connected nornNET TCP socket is part of the module; the same code runs
+on Linux against the module's test server, which is where most of its verification
+happens. It does GET, POST, PUT, DELETE, PATCH, HEAD and OPTIONS, custom headers,
+request bodies from a buffer or streamed from a callback with a known length,
+Content-Length, chunked and close-delimited responses, trailers, informational
+responses, closed byte ranges with 206 checking, HTTP/1.0 servers, and keep-alive. It
+does not do TLS, redirects, compression, cookies, DNS or HTTP/2; TLS is a transport the
+application would supply.
+
+The response body is streamed: the parser hands each span of decoded bytes to a
+callback as it arrives, so a download of megabytes needs only the receive buffer the
+application chose (the ESP32 example below uses 512 bytes). The size of a response does
+not decide the RAM cost; the longest header line and the longest request head do.
+
+\subsection{Using it}
+
+\code{app.mk} adds the sources and the adapter; the \code{wifi\_http} example in
+nornRTOS has the lines. With a socket already connected (\code{nn\_tcpConnect}), one
+request is:
+
+\begin{lstlisting}
+static char line[256], request[256];          /* longest header line, request head */
+static uint8_t receive[512], body[128];       /* one recv at a time, a small body */
+static norn_http http;
+
+norn_http_net_context net = { &socket, now_ms, NULL };   /* now_ms wraps nn_os_now */
+norn_http_transport transport;
+norn_http_config config = {0};
+norn_http_body_buffer sink = { body, sizeof(body), 0 };
+norn_http_request req;
+norn_http_response resp;
+
+norn_http_net_transport_init(&transport, &net);
+norn_http_parser_config_init(&config.parser, line, sizeof(line));
+config.parser.on_body = norn_http_buffer_body;    /* or your own callback */
+config.parser.callback_context = &sink;
+config.receive_buffer = receive;   config.receive_capacity = sizeof(receive);
+config.request_buffer = request;   config.request_capacity = sizeof(request);
+config.timeout_ms = 5000;                         /* the whole request and response */
+norn_http_init(&http, &config, &transport);
+
+norn_http_request_init(&req, "GET", "/hello", "192.168.1.10:18080", NULL, 0);
+if(norn_http_execute(&http, &req, &resp) == NORN_HTTP_OK)
+    ...                        /* resp.status, sink.length bytes in body, resp.reusable */
+\end{lstlisting}
+
+A POST adds \code{norn\_http\_add\_header(\&req, "Content-Type", "application/json")}
+and \code{norn\_http\_set\_body(\&req, json, length)}, or
+\code{norn\_http\_set\_body\_source} with a callback that fills the request buffer span
+by span when the body is not in RAM as a whole. A large download replaces the body
+callback with one that writes each span to its destination, or checks it, and stores
+nothing. \code{resp.reusable} says whether the same socket may carry the next request;
+\code{req.close} asks the server to close after this one.
+
+Every function returns a \code{norn\_http\_result}; zero is success, the HTTP status is
+a separate matter in \code{resp.status}. After a negative result from
+\code{norn\_http\_execute} the connection is in an unknown state: abort the socket and
+call \code{norn\_http\_init} again (the context answers \code{NORN\_HTTP\_STALE} until
+then). An argument error (\code{INVALID}, or \code{LIMIT} from the request builder) is
+reported before anything is sent and leaves the connection as it was. The full
+contract, including what the parser rejects and why, is \code{nornHTTP/docs/contracts.md};
+the API reference is generated from \code{norn\_http.h} together with the kernel's.
+
+\subsection{What it costs}
+
+Measured on the NodeMCU-32S with the \code{wifi\_http} example (GET, JSON POST, a
+64\,KiB download through the 512-byte buffer with every byte checked, keep-alive, then
+Connection: close): the whole image grows by 7.0\,KB of flash, of which about 5.3\,KB is
+the library and 0.2\,KB the nornNET adapter. The library has no static RAM; the
+context is 184 bytes, a request 64 and a response 56, and the example's buffers add
+1.2\,KB. The main task's stack high-water went from 1.3\,KB after the Wi-Fi join and
+TCP connect to at most 1.5\,KB after the four requests, of 4\,KB; the library's own
+frames are small (the deepest chain inside it is about 240 bytes), the rest is the TCP
+path and the kernel running on the caller's stack. Details and the method are in
+\code{nornHTTP/docs/measurements.md}.

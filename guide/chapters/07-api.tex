@@ -1,0 +1,545 @@
+\chapter{API reference}
+\label{ch:api}
+
+The reference follows the groups of \code{kernel/rtos.h}. Every entry gives the
+prototype, the behaviour, the parameters, the calling context, and which contracts are
+\emph{checked} (always) or \emph{asserted} (\code{RTOS\_CFG\_ASSERT}). Unless an entry
+says otherwise, a \code{timeout} is in ticks: \code{RTOS\_NO\_WAIT} polls,
+\code{RTOS\_FOREVER} waits for good, any other value is at most
+\code{RTOS\_MAX\_TIMEOUT} (checked). Functions that may wake a higher task run it before
+they return; their \code{FromIsr} variants defer the switch to the end of the interrupt.
+The generated reference (\code{make api} in nornDocs) has the same text per function
+with the remaining details.
+
+\clearpage
+\section{Constants and types}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.38\linewidth}X@{}}
+\toprule
+Name & Meaning \\
+\midrule
+\code{RTOS\_VERSION}           & version string of the kernel \\
+\code{RTOS\_IDLE\_TASK}        & 0, the idle task \\
+\code{RTOS\_NUM\_TASKS}        & \code{RTOS\_CFG\_NUM\_TASKS + 1} \\
+\code{RTOS\_NO\_TASK}          & 0xFF, ``no task'' \\
+\code{RTOS\_STACK\_MIN / DEFAULT / LARGE} & the port's stack sizes (table~\ref{tab:stacksizes}) \\
+\code{RTOS\_FOREVER}, \code{RTOS\_NO\_WAIT} & timeouts: never, poll \\
+\code{RTOS\_MAX\_TIMEOUT}      & the longest finite timeout, half the tick range \\
+\code{RTOS\_MS(ms)}            & milliseconds to ticks, at compile time \\
+\code{RTOS\_WAIT\_ANY / ALL}   & options of \code{rtos\_waitEvents}, \code{rtos\_evgroupWait} \\
+\code{RTOS\_WAIT\_CLEAR}       & \code{rtos\_evgroupWait}: take the satisfying bits out of the group \\
+\code{RTOS\_NOTIFY\_SET / OR / INC} & operations of \code{rtos\_notify} \\
+\code{RTOS\_SEM\_INIT(n)}, \code{RTOS\_SEM\_INIT\_BINARY(n)}, \code{RTOS\_SEM\_INIT\_MAX(n, max)} & static semaphore initialisers \\
+\code{RTOS\_MUTEX\_INIT(ceiling)} & static mutex initialiser \\
+\code{RTOS\_QUEUE\_INIT(storage, itemSize, capacity)} & static queue initialiser \\
+\code{RTOS\_MBOX\_INIT(storage, itemSize)} & static mailbox initialiser \\
+\code{RTOS\_POOL\_INIT(storage, blockSize, numBlocks)} & static pool initialiser; \code{rtos\_poolInit} is still required \\
+\code{RTOS\_EVGROUP\_INIT(bits)} & static event group initialiser \\
+\code{RTOS\_RUNTIME\_HZ}, \code{RTOS\_RUNTIME\_TO\_MS(t)} & run time counter frequency and conversion \\
+\code{rtos\_tick\_t}, \code{rtos\_evt\_t}, \code{rtos\_taskmask\_t}, \code{rtos\_runtime\_t} & the tick, event flag, task mask and run time types; widths from the configuration and the port \\
+\code{rtos\_taskFunc\_t}, \code{rtos\_timerFunc\_t} & \code{void f(void *arg)} \\
+\code{rtos\_sem\_t}, \code{rtos\_mutex\_t}, \code{rtos\_queue\_t}, \code{rtos\_mbox\_t}, \code{rtos\_pool\_t}, \code{rtos\_timer\_t}, \code{rtos\_evgroup\_t} & the kernel objects; treat as opaque except for the statistics fields named in chapter~\ref{ch:robust} \\
+\code{rtos\_taskInfo\_t}, \code{rtos\_panicInfo\_t}, \code{rtos\_heapStats\_t} & diagnostic records \\
+\code{RTOS\_TASK\_*}, \code{RTOS\_WAIT\_*}, \code{RTOS\_RESET\_*}, \code{RTOS\_TRACE\_*} & task states, wait kinds, reset causes, trace events \\
+\bottomrule
+\end{tabularx}
+\caption{Constants and types.}
+\end{table}
+
+% -----------------------------------------------------------------------------------------
+\section{Kernel life cycle}
+
+\apihead{rtos\_init}
+\begin{lstlisting}
+#define rtos_init()   rtos_initChecked(RTOS_CONFIG_SIGNATURE)
+\end{lstlisting}
+Resets all kernel data: every task slot, the ready mask, the wake-up list and the tick
+count, and takes the panic record of the previous boot out of the memory that survives a
+reset. The macro passes the configuration signature; a kernel compiled with another
+configuration stops at once with \code{RTOS\_PANIC\_CONFIG}.
+\apipre{Called from \code{main()}, before any other kernel function, once.}
+
+\apihead{rtos\_createTask}
+\begin{lstlisting}
+void rtos_createTask(uint8_t prio, rtos_taskFunc_t taskFunc, void *arg,
+                     uint8_t *stackArea, size_t stackSize);
+\end{lstlisting}
+Creates the task at priority \code{prio} on the caller's stack. The task is ready at once
+and runs at the earliest at \code{rtos\_start}. The stack start is aligned up and the
+size rounded down to the port's alignment (1 byte on the AVR, 16 on the ESP32), which
+may reduce the usable size; with \code{RTOS\_CFG\_STACK\_CHECK} the area is filled with
+the pattern.
+\begin{apiparams}
+\item[prio] task priority and id, 1 to \code{RTOS\_CFG\_NUM\_TASKS}; the slot must be free.
+\item[taskFunc] the task's function; should never return (section~\ref{sec:lifecycle}).
+\item[arg] passed to the function unchanged.
+\item[stackArea, stackSize] caller allocated memory, valid for as long as the system
+  runs; at least \code{RTOS\_STACK\_MIN} after alignment.
+\end{apiparams}
+\apipre{After \code{rtos\_init}, before \code{rtos\_start}. Creating a task while the
+scheduler runs is not supported yet.}
+\apichecked{\code{prio} out of range, a NULL function or stack, a slot in use, a stack
+below the minimum.}
+
+\apihead{rtos\_start}
+\begin{lstlisting}
+void rtos_start(void);
+\end{lstlisting}
+Creates the timer task if configured, starts the tick, switches to the highest ready
+task and never returns. The calling context becomes the idle task.
+
+% -----------------------------------------------------------------------------------------
+\section{Time and delays}
+
+\apihead{rtos\_getTick}
+\begin{lstlisting}
+rtos_tick_t rtos_getTick(void);
+\end{lstlisting}
+\apireturns{the ticks since \code{rtos\_start}. The counter wraps (16 bits: 65.5 s at
+1 kHz; 32 bits: 49.7 days); compare as differences.}
+\apicontext{any.}
+
+\apihead{rtos\_delay}
+\begin{lstlisting}
+void rtos_delay(rtos_tick_t ticks);
+\end{lstlisting}
+Blocks the calling task for at least \code{ticks} ticks; the real delay is between
+\code{ticks} and \code{ticks + 1} periods. A delay of 0 waits for the next tick. Any
+value is accepted: a delay above \code{RTOS\_MAX\_TIMEOUT} is done as a sequence of
+waits, \code{RTOS\_FOREVER} blocks for good.
+\apicontext{task; not the idle task (checked).}
+
+\apihead{rtos\_waitPeriodic}
+\begin{lstlisting}
+bool rtos_waitPeriodic(rtos_tick_t period);
+\end{lstlisting}
+Blocks until the task's next period boundary; each boundary is the previous one plus
+\code{period}, so the task runs drift free. If the boundary has passed, the call returns
+at once, counts an overrun and computes the next boundary from now. The first boundary
+is the task's start plus \code{period}. The period may change from call to call.
+\begin{apiparams}
+\item[period] 1 to \code{RTOS\_MAX\_TIMEOUT}.
+\end{apiparams}
+\apireturns{\code{true} on an overrun, \code{false} after a normal wait.}
+\apicontext{task; not the idle task.}
+\apichecked{a period of 0 or above the limit.}
+
+% -----------------------------------------------------------------------------------------
+\section{Task event flags}
+
+\apihead{rtos\_waitEvents}
+\begin{lstlisting}
+rtos_evt_t rtos_waitEvents(rtos_evt_t mask, uint8_t opt, rtos_tick_t timeout);
+\end{lstlisting}
+Waits until events of \code{mask} are pending for the calling task. Events posted
+earlier stay pending until a wait consumes them. The events that satisfy the wait are
+cleared and returned; pending events outside the mask are kept.
+\begin{apiparams}
+\item[mask] the events to wait for; not 0 (asserted).
+\item[opt] \code{RTOS\_WAIT\_ANY} or \code{RTOS\_WAIT\_ALL}.
+\end{apiparams}
+\apireturns{the consumed events (with \code{RTOS\_WAIT\_ALL}: the mask); 0 on timeout.}
+\apicontext{task; the idle task may only poll.}
+
+\apihead{rtos\_postEvents, rtos\_postEventsFromIsr}
+\begin{lstlisting}
+void rtos_postEvents(uint8_t taskId, rtos_evt_t events);
+void rtos_postEventsFromIsr(uint8_t taskId, rtos_evt_t events);
+\end{lstlisting}
+ORs the events into the task's pending events; a task whose wait is thereby satisfied
+becomes ready.
+\apichecked{\code{taskId} 1 to \code{RTOS\_CFG\_NUM\_TASKS}.}
+
+\apihead{rtos\_broadcastEvents}
+\begin{lstlisting}
+void rtos_broadcastEvents(rtos_evt_t events);
+\end{lstlisting}
+Posts the events to every created task (not the idle task).
+\apicontext{task.}
+
+% -----------------------------------------------------------------------------------------
+\section{Counting semaphores}
+
+\apihead{rtos\_semInit, rtos\_semInitMax}
+\begin{lstlisting}
+void rtos_semInit(rtos_sem_t *pSem, uint8_t initialCount);
+void rtos_semInitMax(rtos_sem_t *pSem, uint8_t initialCount, uint8_t maxCount);
+\end{lstlisting}
+The run time alternatives to the static initialisers. Without a limit the count is
+bounded by its type, 255; with \code{maxCount} a give at the limit is dropped and counted
+as lost (1 makes a binary semaphore).
+\apipre{no task waits on the semaphore.}
+\apiasserted{\code{initialCount} at most \code{maxCount}, \code{maxCount} at least 1.}
+
+\apihead{rtos\_semTake}
+\begin{lstlisting}
+bool rtos_semTake(rtos_sem_t *pSem, rtos_tick_t timeout);
+\end{lstlisting}
+Takes one token, waiting up to \code{timeout} for it.
+\apireturns{\code{true} if a token was taken, \code{false} on timeout.}
+\apicontext{task; the idle task may only poll.}
+
+\apihead{rtos\_semGive, rtos\_semGiveFromIsr}
+\begin{lstlisting}
+void rtos_semGive(rtos_sem_t *pSem);
+void rtos_semGiveFromIsr(rtos_sem_t *pSem);
+\end{lstlisting}
+Gives one token. If tasks wait, the highest gets it directly and the count does not
+change; otherwise the count goes up or, at the limit, the give is lost.
+
+% -----------------------------------------------------------------------------------------
+\section{Ceiling mutexes}
+
+\apihead{rtos\_mutexInit}
+\begin{lstlisting}
+void rtos_mutexInit(rtos_mutex_t *pMutex, uint8_t ceilingPrio);
+\end{lstlisting}
+The run time alternative to \code{RTOS\_MUTEX\_INIT}. \code{ceilingPrio} is the highest
+priority of any task that will ever lock the mutex.
+\apipre{the mutex is not locked.}
+
+\apihead{rtos\_mutexLock}
+\begin{lstlisting}
+void rtos_mutexLock(rtos_mutex_t *pMutex);
+\end{lstlisting}
+Raises the caller's effective priority to the ceiling and takes the mutex. With a correct
+ceiling the call never blocks. If the mutex is held anyway (a ceiling too low, or an
+owner that blocked while holding), the caller waits without a timeout and the unlock
+hands the mutex over to the highest waiter.
+\apicontext{task; not the idle task (asserted).}
+\apiasserted{the caller does not already hold the mutex (not recursive); the caller's
+priority is at most the ceiling.}
+\apinote{Panics}{a wait that would close a cycle of mutex waits is
+\code{RTOS\_PANIC\_DEADLOCK} (the caller, the owner).}
+
+\apihead{rtos\_mutexUnlock}
+\begin{lstlisting}
+void rtos_mutexUnlock(rtos_mutex_t *pMutex);
+\end{lstlisting}
+Drops the caller's effective priority back to what it was before the lock. A waiting
+task becomes the owner at once, at the ceiling. Either change may let another task run
+before the call returns.
+\apicontext{task.}
+\apiasserted{the caller owns the mutex; mutexes are unlocked in the reverse order of
+locking.}
+
+% -----------------------------------------------------------------------------------------
+\section{Message queues}
+
+\apihead{rtos\_queueInit}
+\begin{lstlisting}
+void rtos_queueInit(rtos_queue_t *pQ, uint8_t *storage, uint8_t itemSize, uint8_t capacity);
+\end{lstlisting}
+The run time alternative to \code{RTOS\_QUEUE\_INIT}. \code{storage} holds
+\code{itemSize * capacity} bytes and stays valid for as long as the queue is used.
+\apichecked{a NULL storage, an item size or a capacity of 0.}
+
+\apihead{rtos\_queueSend, rtos\_queueSendFromIsr}
+\begin{lstlisting}
+bool rtos_queueSend(rtos_queue_t *pQ, const void *pItem, rtos_tick_t timeout);
+bool rtos_queueSendFromIsr(rtos_queue_t *pQ, const void *pItem);
+\end{lstlisting}
+Copies an item into the queue, waiting up to \code{timeout} for room (the ISR variant
+never waits). If a task is blocked in receive, the item goes straight into that task's
+buffer. While the caller waits, the item is read at the moment a receiver frees a slot:
+it must not change until the call returns. A failed send is counted as dropped.
+\apireturns{\code{true} if the item was queued.}
+
+\apihead{rtos\_queueReceive, rtos\_queueReceiveFromIsr}
+\begin{lstlisting}
+bool rtos_queueReceive(rtos_queue_t *pQ, void *pItem, rtos_tick_t timeout);
+bool rtos_queueReceiveFromIsr(rtos_queue_t *pQ, void *pItem);
+\end{lstlisting}
+Copies the oldest item out, waiting up to \code{timeout} for one. If a sender is blocked
+because the queue was full, its item moves into the freed slot.
+\apireturns{\code{true} if an item was received.}
+
+\apihead{rtos\_queueCount}
+\begin{lstlisting}
+uint8_t rtos_queueCount(const rtos_queue_t *pQ);
+\end{lstlisting}
+\apireturns{the items stored now; a snapshot.} \apicontext{any.}
+
+% -----------------------------------------------------------------------------------------
+\section{Mailboxes}
+
+\apihead{rtos\_mboxInit, rtos\_mboxPost, rtos\_mboxPostFromIsr, rtos\_mboxFetch, rtos\_mboxIsFull}
+\begin{lstlisting}
+void rtos_mboxInit(rtos_mbox_t *pMb, uint8_t *storage, uint8_t itemSize);
+bool rtos_mboxPost(rtos_mbox_t *pMb, const void *pItem);
+bool rtos_mboxPostFromIsr(rtos_mbox_t *pMb, const void *pItem);
+bool rtos_mboxFetch(rtos_mbox_t *pMb, void *pItem, rtos_tick_t timeout);
+bool rtos_mboxIsFull(const rtos_mbox_t *pMb);
+\end{lstlisting}
+A post never blocks: it replaces an unread item (counted in \code{overwrites}, and the
+post returns \code{true}) or, if a task is blocked in fetch, copies the item straight
+into that task's buffer. A fetch takes the item and leaves the mailbox empty; it returns
+\code{false} on timeout. \code{rtos\_mboxIsFull} tells whether an unread item waits.
+\apichecked{\code{rtos\_mboxInit}: a NULL storage or an item size of 0.}
+
+% -----------------------------------------------------------------------------------------
+\section{Task notifications}
+
+\apihead{rtos\_notify, rtos\_notifyFromIsr}
+\begin{lstlisting}
+void rtos_notify(uint8_t taskId, uint16_t value, uint8_t op);
+void rtos_notifyFromIsr(uint8_t taskId, uint16_t value, uint8_t op);
+\end{lstlisting}
+Updates the task's 16 bit notification value and wakes the task if it waits in
+\code{rtos\_notifyWait}, or in \code{rtos\_notifyTake} and the value is now non-zero.
+\begin{apiparams}
+\item[op] \code{RTOS\_NOTIFY\_SET} replaces the value, \code{RTOS\_NOTIFY\_OR} ORs
+  \code{value} in, \code{RTOS\_NOTIFY\_INC} adds one, saturating at 0xFFFF.
+\end{apiparams}
+\apichecked{\code{taskId}.}
+
+\apihead{rtos\_notifyWait}
+\begin{lstlisting}
+bool rtos_notifyWait(uint16_t *pValue, rtos_tick_t timeout);
+\end{lstlisting}
+Returns as soon as any notification has arrived since the last successful wait, even one
+that set the value to 0, stores the value in \code{*pValue} (may be NULL) and resets it to 0.
+\apicontext{task; the idle task may only poll.}
+
+\apihead{rtos\_notifyTake}
+\begin{lstlisting}
+bool rtos_notifyTake(rtos_tick_t timeout);
+\end{lstlisting}
+Waits until the value is non-zero and decrements it by one: with
+\code{RTOS\_NOTIFY\_INC} on the sending side, a counting semaphore without an object. A
+task should use either \code{rtos\_notifyWait} or \code{rtos\_notifyTake}, not both.
+
+% -----------------------------------------------------------------------------------------
+\section{Software timers}
+
+\apihead{rtos\_timerInit}
+\begin{lstlisting}
+void rtos_timerInit(rtos_timer_t *pT, rtos_timerFunc_t callback, void *arg);
+\end{lstlisting}
+Prepares an inactive timer. Where the callback runs depends on
+\code{RTOS\_CFG\_TIMER\_TASK\_PRIO}: in the tick interrupt (0; only ISR body functions
+allowed) or in the timer task.
+\apichecked{a NULL callback.}
+
+\apihead{rtos\_timerStart}
+\begin{lstlisting}
+void rtos_timerStart(rtos_timer_t *pT, rtos_tick_t delay, rtos_tick_t period);
+\end{lstlisting}
+Arms the timer, or restarts it if active. The first expiry is on the \code{delay}-th tick
+from now (after \code{delay - 1} to \code{delay} periods; 0 and 1 both mean the next
+tick); after that every \code{period} ticks exactly, counted from the previous expiry.
+\code{period} 0 is a one shot timer. The time spent with interrupts disabled grows with
+the number of active timers.
+\apicontext{any.}
+\apichecked{the timer was initialised; \code{delay} and \code{period} at most the limit.}
+
+\apihead{rtos\_timerStop, rtos\_timerIsActive, rtos\_timerRemaining}
+\begin{lstlisting}
+void        rtos_timerStop(rtos_timer_t *pT);
+bool        rtos_timerIsActive(const rtos_timer_t *pT);
+rtos_tick_t rtos_timerRemaining(const rtos_timer_t *pT);
+\end{lstlisting}
+Disarms the timer (nothing happens if it is not active; with a timer task an expiry
+still waiting for the task is dropped, a running callback finishes); tells whether it is
+armed; returns the ticks to the next expiry (0 if inactive or due).
+\apicontext{any.}
+
+% -----------------------------------------------------------------------------------------
+\section{Memory pools}
+
+\apihead{rtos\_poolInit}
+\begin{lstlisting}
+void rtos_poolInit(rtos_pool_t *pPool, uint8_t *storage, uint16_t blockSize, uint8_t numBlocks);
+\end{lstlisting}
+Builds the free list over the storage; also required after \code{RTOS\_POOL\_INIT}. A
+block is returned at the alignment of its offset in the storage, so storage meant for
+aligned objects must be aligned itself and have a block size that is a multiple of that
+alignment.
+\apichecked{a NULL storage, a block size below \code{sizeof(void *)}, 0 blocks.}
+
+\apihead{rtos\_poolAlloc, rtos\_poolAllocFromIsr}
+\begin{lstlisting}
+void *rtos_poolAlloc(rtos_pool_t *pPool, rtos_tick_t timeout);
+void *rtos_poolAllocFromIsr(rtos_pool_t *pPool);
+\end{lstlisting}
+Gets a block, waiting up to \code{timeout} for one to be freed (the ISR variant never
+waits). A failed allocation is counted.
+\apireturns{the block, or NULL.}
+
+\apihead{rtos\_poolFree, rtos\_poolFreeFromIsr, rtos\_poolFreeCount}
+\begin{lstlisting}
+void    rtos_poolFree(rtos_pool_t *pPool, void *pBlock);
+void    rtos_poolFreeFromIsr(rtos_pool_t *pPool, void *pBlock);
+uint8_t rtos_poolFreeCount(const rtos_pool_t *pPool);
+\end{lstlisting}
+Returns a block; a task waiting for one gets it directly.
+\apichecked{a pointer outside the pool or not at the start of a block. A double free is
+caught only when the pool would hold more free blocks than it has.}
+
+% -----------------------------------------------------------------------------------------
+\section{Event groups}
+
+\apihead{rtos\_evgroupInit, rtos\_evgroupSet, rtos\_evgroupSetFromIsr, rtos\_evgroupClear, rtos\_evgroupGet}
+\begin{lstlisting}
+void       rtos_evgroupInit(rtos_evgroup_t *pG, rtos_evt_t initialBits);
+void       rtos_evgroupSet(rtos_evgroup_t *pG, rtos_evt_t bits);
+void       rtos_evgroupSetFromIsr(rtos_evgroup_t *pG, rtos_evt_t bits);
+void       rtos_evgroupClear(rtos_evgroup_t *pG, rtos_evt_t bits);
+rtos_evt_t rtos_evgroupGet(const rtos_evgroup_t *pG);
+\end{lstlisting}
+Set wakes every waiter whose condition is now met, highest priority first; a waiter that
+asked for \code{RTOS\_WAIT\_CLEAR} takes its bits out as it is woken. Clear wakes nobody.
+With waiters present, set checks every task slot with interrupts disabled.
+
+\apihead{rtos\_evgroupWait}
+\begin{lstlisting}
+rtos_evt_t rtos_evgroupWait(rtos_evgroup_t *pG, rtos_evt_t mask, uint8_t options,
+                            rtos_tick_t timeout);
+\end{lstlisting}
+Waits until bits of \code{mask} are set. \code{options} is \code{RTOS\_WAIT\_ANY} or
+\code{RTOS\_WAIT\_ALL}, optionally with \code{RTOS\_WAIT\_CLEAR}.
+\apireturns{the satisfying bits (with ALL: the mask); 0 on timeout.}
+\apiasserted{\code{mask} not 0.}
+
+% -----------------------------------------------------------------------------------------
+\section{Suspend and resume}
+
+\apihead{rtos\_suspend, rtos\_resume, rtos\_resumeFromIsr}
+\begin{lstlisting}
+void rtos_suspend(uint8_t taskId);
+void rtos_resume(uint8_t taskId);
+void rtos_resumeFromIsr(uint8_t taskId);
+\end{lstlisting}
+Suspend keeps the task from running until a resume; a blocked task stays in its wait, a
+wake-up that arrives meanwhile takes effect at the resume. No nesting count; a task may
+suspend itself. A suspended task keeps its mutexes. Resume does nothing to a task that is
+not suspended.
+\apichecked{\code{taskId}; not the idle task.}
+
+% -----------------------------------------------------------------------------------------
+\section{Heap}
+
+\apihead{rtos\_heapInit, rtos\_malloc, rtos\_free, rtos\_heapStats}
+\begin{lstlisting}
+void  rtos_heapInit(void *area, size_t size);
+void *rtos_malloc(size_t size);
+void  rtos_free(void *p);
+void  rtos_heapStats(rtos_heapStats_t *pStats);
+\end{lstlisting}
+A first fit allocator with coalescing over the area given once to \code{rtos\_heapInit}.
+Blocks are aligned to \code{2 * sizeof(void *)}. The search runs with interrupts
+disabled and its time grows with the number of free blocks. \code{rtos\_free} ignores
+NULL.
+\apicontext{task.}
+\apichecked{a NULL or too small area; \code{rtos\_malloc} before \code{rtos\_heapInit};
+a freed pointer outside the heap or already free. A pointer into the middle of a block is
+not detected.}
+
+% -----------------------------------------------------------------------------------------
+\section{Diagnostics}
+
+\apihead{rtos\_getCurrentTask}
+\begin{lstlisting}
+uint8_t rtos_getCurrentTask(void);
+\end{lstlisting}
+\apireturns{the running task's id; 0 in the idle task; in an ISR body the interrupted task.}
+
+\apihead{rtos\_getOverrunCount}
+\begin{lstlisting}
+uint8_t rtos_getOverrunCount(uint8_t taskId, bool reset);
+\end{lstlisting}
+\apireturns{the period overruns of the task since the start or the last reset; saturates
+at 255. \code{reset} clears the counter after reading.} \apichecked{\code{taskId} 0 to
+\code{RTOS\_CFG\_NUM\_TASKS}.}
+
+\apihead{rtos\_getStackFree}
+\begin{lstlisting}
+size_t rtos_getStackFree(uint8_t taskId);
+\end{lstlisting}
+\apireturns{the bytes at the bottom of the task's stack never used since creation; 0 for
+the idle task, a task never created, or without \code{RTOS\_CFG\_STACK\_CHECK}. The scan
+reads the stack byte by byte with interrupts enabled.}
+
+\apihead{rtos\_getTimeUs}
+\begin{lstlisting}
+uint32_t rtos_getTimeUs(void);
+\end{lstlisting}
+\apireturns{microseconds since start from the port's free running time base; wraps after
+71.6 minutes.} \apicontext{any.}
+
+\apihead{rtos\_getTaskRunTime, rtos\_getCpuLoad}
+\begin{lstlisting}
+rtos_runtime_t rtos_getTaskRunTime(uint8_t taskId);
+uint8_t        rtos_getCpuLoad(void);
+\end{lstlisting}
+With \code{RTOS\_CFG\_RUNTIME\_STATS}: the accumulated run time of a task in counts of
+\code{RTOS\_RUNTIME\_HZ} (the running task's includes the current slice), and the share
+of time not spent in the idle task since the previous call, 0 to 100. Every call of
+\code{rtos\_getCpuLoad} starts a new interval, so one task should own the readings.
+
+\apihead{rtos\_getTaskInfo}
+\begin{lstlisting}
+bool rtos_getTaskInfo(uint8_t taskId, rtos_taskInfo_t *pInfo);
+\end{lstlisting}
+Fills a snapshot: state (\code{RTOS\_TASK\_*}), priority, effective priority, wait kind
+and object, timeout, stack size and free, run time, overruns.
+\apireturns{\code{true}; \code{false} for an id out of range or a NULL \code{pInfo}
+(not a panic).}
+
+% -----------------------------------------------------------------------------------------
+\section{Panic and reset cause}
+
+\apihead{rtos\_panic}
+\begin{lstlisting}
+void rtos_panic(uint8_t reason, uint32_t arg1, uint32_t arg2) __attribute__((noreturn));
+\end{lstlisting}
+Disables interrupts, records the reason and the arguments in memory that survives a
+reset, calls \code{rtos\_panicHook} and halts or resets (\code{RTOS\_CFG\_PANIC\_ACTION}).
+Applications use \code{RTOS\_PANIC\_APPLICATION}.
+\apicontext{any.}
+
+\apihead{rtos\_getLastPanic, rtos\_getResetCause}
+\begin{lstlisting}
+bool    rtos_getLastPanic(rtos_panicInfo_t *pInfo);
+uint8_t rtos_getResetCause(void);
+\end{lstlisting}
+The record left before the last reset, reported in one boot only (\code{pInfo} may be
+NULL to ask only), and the cause of the last reset as the hardware reports it
+(\code{RTOS\_RESET\_*}).
+
+% -----------------------------------------------------------------------------------------
+\section{Hooks}
+
+\apihead{rtos\_idleHook, rtos\_panicHook, rtos\_stackWarnHook, rtos\_assertFailed, rtos\_traceHook}
+\begin{lstlisting}
+void rtos_idleHook(void);
+void rtos_panicHook(const rtos_panicInfo_t *pInfo);
+void rtos_stackWarnHook(uint8_t task, size_t stackFree);
+void rtos_assertFailed(const char *file, uint16_t line) __attribute__((noreturn, cold));
+void rtos_traceHook(uint8_t event, uint32_t a, uint32_t b);
+\end{lstlisting}
+Weak functions the application overrides. The idle hook runs in every idle loop and
+must not block. The panic hook runs with interrupts disabled before the halt or reset and
+must not call the kernel. The stack warning hook is called once per task whose margin is
+gone. \code{rtos\_assertFailed} is called for a failed assertion; its default stores file
+and line and panics, and an override must not return either. The trace hook is called
+with interrupts disabled at every traced event (\code{RTOS\_TRACE\_SWITCH}, \code{BLOCK},
+\code{READY}, \code{TIMER}, \code{PANIC}) and must not call the kernel.
+
+% -----------------------------------------------------------------------------------------
+\section{Watchdog}
+
+\apihead{rtos\_wdtInit, rtos\_wdtMonitor, rtos\_wdtCheckIn}
+\begin{lstlisting}
+void rtos_wdtInit(uint32_t timeoutMs);
+void rtos_wdtMonitor(uint8_t task, rtos_tick_t maxInterval);
+void rtos_wdtCheckIn(void);
+\end{lstlisting}
+Starts the hardware watchdog (the timeout is rounded up to what the hardware offers;
+the idle task kicks it only after \code{rtos\_start}); requires a task to check in at
+least every \code{maxInterval} ticks (0 stops monitoring it; the first deadline is
+\code{maxInterval} from now); tells the watchdog the calling task is alive.
+\apichecked{\code{task}; \code{maxInterval} at most the limit.}
+\apiasserted{\code{timeoutMs} above 0.}

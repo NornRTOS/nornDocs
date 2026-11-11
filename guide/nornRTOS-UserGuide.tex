@@ -1,0 +1,160 @@
+% nornRTOS User Guide
+% Build: latexmk -pdf nornRTOS-UserGuide.tex   (or: make guide, from the nornDocs directory)
+% Graph data: tools/measurements_to_csv.py regenerates data/*.csv from nornCore's
+% doc/measurements/ summaries; data/latest.tex names the summary the figures show.
+\documentclass[11pt,a4paper,twoside,openany]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[a4paper,margin=25mm,bindingoffset=5mm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,array,longtable,tabularx}
+\usepackage{graphicx,xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.misc,calc}
+\usepackage{pgfplots,pgfplotstable}
+\pgfplotsset{compat=1.17}
+\usepackage{fancyhdr}
+\usepackage{makeidx}
+\usepackage[hidelinks,pdftitle={nornRTOS User Guide},pdfauthor={Tenforward AB}]{hyperref}
+
+\input{data/latest}
+
+% ---- colours and code -------------------------------------------------------------------
+\definecolor{nornblue}{RGB}{31,73,125}
+\definecolor{nornred}{RGB}{170,40,40}
+\definecolor{norngrey}{RGB}{110,110,110}
+\definecolor{codebg}{RGB}{246,246,248}
+
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{nornblue}\bfseries,
+  commentstyle=\color{norngrey}\itshape,
+  stringstyle=\color{nornred},
+  backgroundcolor=\color{codebg},
+  frame=single, framerule=0pt, framesep=4pt,
+  xleftmargin=4pt, xrightmargin=4pt,
+  columns=fullflexible, keepspaces=true,
+  showstringspaces=false, breaklines=true,
+  tabsize=4,
+  morekeywords={uint8_t,uint16_t,uint32_t,int16_t,int32_t,size_t,bool,rtos_tick_t,rtos_evt_t,
+    rtos_sem_t,rtos_mutex_t,rtos_queue_t,rtos_mbox_t,rtos_pool_t,rtos_timer_t,rtos_evgroup_t,
+    rtos_taskInfo_t,rtos_panicInfo_t,rtos_heapStats_t,rtos_runtime_t,rtos_taskFunc_t,
+    rtos_timerFunc_t,nn_err_t,nn_udp_t,nn_tcp_t,nn_ip4_t,nn_iface_t,nn_dhcp_t,esp_err_t},
+}
+
+% ---- API reference layout ---------------------------------------------------------------
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\apihead}[1]{%
+  \par\addvspace{1.4em}\penalty-300\noindent
+  \index{#1}%
+  {\large\bfseries\ttfamily #1}\par\nopagebreak\vspace{1pt}%
+  {\color{nornblue}\hrule height 0.8pt}\par\nopagebreak\vspace{3pt}}
+\newlist{apiparams}{description}{1}
+\setlist[apiparams]{=\ttfamily, leftmargin=2.2em, labelindent=0pt, itemsep=1pt, topsep=2pt}
+\newcommand{\apinote}[2]{\par\nopagebreak\vspace{1pt}\noindent\textit{#1:}\enspace #2\par}
+\newcommand{\apireturns}[1]{\apinote{Returns}{#1}}
+\newcommand{\apicontext}[1]{\apinote{Context}{#1}}
+\newcommand{\apichecked}[1]{\apinote{Checked}{#1}}
+\newcommand{\apiasserted}[1]{\apinote{Asserted}{#1}}
+\newcommand{\apipre}[1]{\apinote{Precondition}{#1}}
+
+% ---- graph defaults -----------------------------------------------------------------------
+\pgfplotsset{
+  nornbar/.style={
+    ybar, bar width=6pt, width=\linewidth, height=6.5cm,
+    enlarge x limits=0.08, ymin=0,
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\small, draw=none, fill=none},
+    tick label style={font=\small}, label style={font=\small},
+    xtick=data, x tick label style={rotate=40, anchor=east, font=\footnotesize},
+    ymajorgrids, grid style={dotted, gray!60},
+    nodes near coords, every node near coord/.append style={font=\tiny, rotate=90, anchor=west},
+  },
+  nornline/.style={
+    width=\linewidth, height=6.5cm,
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\small, draw=none, fill=none},
+    tick label style={font=\small}, label style={font=\small},
+    xtick=data, x tick label style={rotate=40, anchor=east, font=\footnotesize},
+    ymajorgrids, grid style={dotted, gray!60},
+  },
+}
+\pgfplotstableread[col sep=comma]{data/api.csv}\apitable
+\pgfplotstableread[col sep=comma]{data/switch.csv}\switchtable
+\pgfplotstableread[col sep=comma]{data/isr.csv}\isrtable
+\pgfplotstableread[col sep=comma]{data/ram.csv}\ramtable
+\pgfplotstableread[col sep=comma]{data/stack11.csv}\stackeleventable
+\pgfplotstableread[col sep=comma]{data/stack12-mega2560.csv}\stackmegatable
+\pgfplotstableread[col sep=comma]{data/stack12-esp32.csv}\stackesptable
+\pgfplotstableread[col sep=comma]{data/history.csv}\historytable
+
+% ---- page style ---------------------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\nouppercase{\leftmark}}
+\fancyhead[RO]{\small\nouppercase{\rightmark}}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\setlength{\headheight}{14pt}
+\setlist{noitemsep, topsep=3pt}
+\setcounter{tocdepth}{2}
+\setcounter{secnumdepth}{2}
+\makeindex
+
+\title{\Huge nornRTOS\\[0.4em]\huge User Guide\\[1.5em]
+  \large A real time operating system for small microcontrollers:\\
+  the nornCore kernel, nornNET and nornWIFI\\[1.5em]
+  \normalsize Kernel \code{RTOS\_VERSION} 2.0.0-dev, measurements of \measDate}
+\author{Tenforward AB}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\vspace*{\fill}
+\noindent
+\begin{minipage}{\linewidth}\small
+\textbf{Licence.} nornRTOS and this guide are licensed under the Business Source License 1.1
+with Tenforward AB's Additional Use Grant: production use in your own products is allowed,
+offering nornRTOS as an operating system, kernel or SDK of your own is not, and each release
+becomes Apache~2.0 four years after it is made. The full text is \code{LICENSE.md} in every
+repository. Third-party components keep their own licences (\code{THIRD\_PARTY\_LICENSES.md}).
+
+\medskip
+\textbf{Sources.} \url{https://github.com/NornRTOS} holds the nornRTOS tree, the modules
+nornCore, nornNET and nornWIFI, and nornDocs, the repository this guide is built from. The
+numbers in this guide come from the measurement summary \code{\measLabel} in nornCore's
+\code{doc/measurements/}; the graphs are regenerated from it by
+\code{tools/measurements\_to\_csv.py}.
+\end{minipage}
+\clearpage
+
+\tableofcontents
+\clearpage
+
+\input{chapters/01-introduction}
+\input{chapters/02-getting-started}
+\input{chapters/03-concepts}
+\input{chapters/04-configuration}
+\input{chapters/05-primitives}
+\input{chapters/06-robustness}
+\input{chapters/07-api}
+\input{chapters/08-networking}
+\input{chapters/09-performance}
+\input{chapters/10-verification}
+
+\appendix
+\input{chapters/A-porting}
+\input{chapters/B-roadmap}
+
+\input{chapters/bibliography}
+\clearpage
+\addcontentsline{toc}{chapter}{Index of API functions}
+\printindex
+
+\end{document}

@@ -1,0 +1,103 @@
+\chapter{Robustness and diagnostics}
+\label{ch:robust}
+
+A kernel for a device that runs unattended has to answer two questions: what does it do
+when the application breaks a rule, and how does the engineer find out what happened. The
+answers in nornCore are a small number of mandatory checks, a panic record that survives
+a reset, and a set of diagnostics that read the kernel's own bookkeeping.
+
+\section{Checks and assertions}
+
+Every public function that takes a task id, a storage pointer, a stack size or a timeout
+validates it with \code{RTOS\_CHECK}, in every configuration. A violation is a
+\emph{panic} with \code{RTOS\_PANIC\_ARGUMENT} and the two offending values in the record;
+there is no error return for an argument that would corrupt memory, because a return
+value is what the caller that made the mistake would ignore. Contracts whose violation
+costs more to detect than it is worth in a release build are \code{RTOS\_ASSERT}ed
+instead and compiled only with \code{RTOS\_CFG\_ASSERT}: recursive locks, the unlock
+order, a lock from the idle task, an empty event mask. Chapter~\ref{ch:api} marks every
+entry \emph{checked} or \emph{asserted}.
+
+\section{Panic and the record}
+
+\code{rtos\_panic(reason, arg1, arg2)} disables interrupts, writes a record (reason,
+running task, tick, the two arguments, and for an assertion the file and line) into
+memory that survives a reset, calls \code{rtos\_panicHook} and then halts
+(\code{RTOS\_CFG\_PANIC\_ACTION 0}) or resets the board (1). After a reset,
+\code{rtos\_init} takes the record out of that memory and \code{rtos\_getLastPanic}
+returns it once; \code{rtos\_getResetCause} says what the hardware thinks happened
+(power on, external, brown out, watchdog, software).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Reason & Meaning, \code{arg1} / \code{arg2} \\
+\midrule
+\code{RTOS\_PANIC\_ASSERT}         & a failed \code{RTOS\_ASSERT}; file and line in the record \\
+\code{RTOS\_PANIC\_STACK\_OVERFLOW} & the canary of task \code{arg1} was overwritten (\code{STACK\_CHECK 2}) \\
+\code{RTOS\_PANIC\_WATCHDOG}       & task \code{arg1} did not check in; \code{RTOS\_NO\_TASK}: the idle task \\
+\code{RTOS\_PANIC\_DEADLOCK}       & task \code{arg1} would wait for a mutex held, through a chain, by itself; \code{arg2} the owner \\
+\code{RTOS\_PANIC\_FAULT}          & a CPU exception; cause and address from the port \\
+\code{RTOS\_PANIC\_CONFIG}         & the application's and the kernel's configuration signatures differ \\
+\code{RTOS\_PANIC\_ARGUMENT}       & a mandatory check refused an argument; the values \\
+\code{RTOS\_PANIC\_APPLICATION}    & \code{rtos\_panic} called by the application; its own arguments \\
+\bottomrule
+\end{tabularx}
+\caption{Panic reasons.}
+\label{tab:panic}
+\end{table}
+
+tc05 provokes four of these in turn on the boards (an application panic, a stack
+overflow, a late task, a starved idle task), lets each reset the board, and checks the
+record after every reset.
+
+\section{Stack checking}
+
+Section~\ref{sec:stacks} has the sizes; this is the machinery. With
+\code{RTOS\_CFG\_STACK\_CHECK} the stack is filled with a pattern at creation and
+\code{rtos\_getStackFree} counts the untouched bytes from the bottom: the high water
+mark since the start. With \code{RTOS\_CFG\_STACK\_WARN} the idle task reads one task's
+mark per loop and calls \code{rtos\_stackWarnHook} once for a task whose margin drops
+below \code{RTOS\_PORT\_STACK\_WARN}. With \code{STACK\_CHECK 2} a canary at the bottom
+is checked before every context switch and at every tick, and an overwritten canary is
+\code{RTOS\_PANIC\_STACK\_OVERFLOW}. The canary catches an overflow after the fact; the
+monitor warns before it.
+
+\section{The watchdog}
+
+\code{RTOS\_CFG\_WATCHDOG} arms the hardware watchdog (\code{rtos\_wdtInit}) and lets the
+idle task kick it, but only after checking that every monitored task
+(\code{rtos\_wdtMonitor}) has called \code{rtos\_wdtCheckIn} within its interval. A late
+task is \code{RTOS\_PANIC\_WATCHDOG} with a record; a starved idle task, which means a
+runaway task or an interrupt storm, lets the hardware reset the board without one, and
+the next boot sees \code{RTOS\_RESET\_WATCHDOG}. The two cases together cover both ways
+a system can hang.
+
+\section{Deadlock detection}
+
+A mutex wait that would close a cycle (A waits for a mutex B holds while B waits for one
+A holds, through any number of tasks) is detected at the moment of the wait and is
+\code{RTOS\_PANIC\_DEADLOCK}. With correct ceilings a wait never happens, so the detector
+is a safety net for a wrong ceiling or an owner that blocked while holding.
+
+\section{Run time statistics and task information}
+
+\code{RTOS\_CFG\_RUNTIME\_STATS} measures the time each task runs, at every switch, in
+counts of \code{RTOS\_RUNTIME\_HZ}. \code{rtos\_getTaskRunTime} returns a task's total,
+\code{rtos\_getCpuLoad} the share of time not spent in the idle task since the previous
+call. \code{rtos\_getTaskInfo} is the snapshot for a console or a debugger: state,
+priority and effective priority, what the task waits on and until when, stack size and
+free, run time, overruns. \code{rtos\_getOverrunCount} reads and optionally resets a
+periodic task's overruns. The kernel objects also carry their own statistics: lost gives
+on a semaphore, dropped sends and the high water mark on a queue, overwrites on a mailbox,
+failed allocations and the low water mark on a pool, the heap's statistics.
+
+\section{Trace}
+
+\code{RTOS\_CFG\_TRACE} calls \code{rtos\_traceHook(event, a, b)} at every context switch
+(the tasks leaving and entering), every block (task and wait kind), every wake-up, every
+timer expiry and every panic, with interrupts disabled. \code{hal/trace.h} is a ring
+buffer recorder to override the hook with, and the host unit tests are built on exactly
+this trace: each test compares the recorded sequence of (task, event, value) with the
+expected one.

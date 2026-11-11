@@ -1,0 +1,146 @@
+\chapter{Getting started}
+\label{ch:start}
+
+\section{Toolchains}
+
+\begin{description}
+\item[AVR] \code{avr-gcc}, \code{avr-libc}, \code{avrdude} for uploading and
+  \code{simavr} for running an image on the host. simavr is cycle exact; every example
+  and every test case runs in it with the same counters as on the board.
+\item[ESP32] Espressif's \code{xtensa-esp-elf} GCC (the variable \code{XTENSA\_ROOT}
+  points at it), \code{esptool} in a Python environment (\code{ESP\_PYTHON}) and,
+  optionally, Espressif's fork of QEMU (\code{QEMU\_ESP}) which runs every example but
+  the WiFi ones. Nothing of ESP-IDF is needed: the kernel brings its own start-up, linker
+  scripts and image format.
+\item[Host] a C compiler and \code{make}. The host port runs the kernel on
+  \code{ucontext} and simulates interrupts, which is how the unit tests run.
+\end{description}
+
+\section{The source tree}
+
+\begin{lstlisting}[language={}]
+nornRTOS/
+  modules/        nornCore, nornNET, nornWIFI    (git submodules)
+  boards/         what each board is and has: esp32, avr (mega2560, uno)
+  examples/       hello, semaphore, basics, timing, bench, net, wifi
+  tools/          submodules.sh, monitor.py, qemu_run.py, bin2c.py
+  Makefile        builds any application from the module sources
+nornCore/
+  kernel/         rtos.h (the API), rtos_types.h, rtos_kernel.c, the primitives
+  port/<arch>/    avr, xtensa, host: port.h, context switch, tick, start-up
+  hal/            uart.h, gpio.h, delay.h, trace.h, testresult.h, board.h per arch
+  config/         rtos_config.template.h, every option documented
+  applications/   tc01..tc12, the test cases that run on the boards
+  test/           test_*.c, the host unit tests
+  tools/          test_all.sh, measure.sh, host_cov.sh, analyze.sh
+  doc/            development material: plans, audits, measurements
+\end{lstlisting}
+
+Clone the tree with its submodules (\code{git clone --recursive}, or
+\code{tools/submodules.sh} afterwards). The public documentation, including this guide,
+is the separate repository nornDocs.
+
+\section{Building and running}
+
+From the nornRTOS directory:
+
+\begin{lstlisting}[language={}]
+make APP=hello BOARD=esp32                        image in modules/nornCore/build/hello-esp32
+make APP=hello BOARD=esp32 sim                    run it in Espressif's QEMU
+make APP=basics BOARD=mega2560 sim                run it in simavr
+make APP=hello BOARD=uno upload PORT=/dev/ttyACM0
+make APP=wifi BOARD=esp32 upload PORT=/dev/ttyUSB0
+make APP=wifi BOARD=esp32 monitor                 serial console
+make APP=myapp APPDIR=/path/to/myapp              an application kept elsewhere
+make test                                         nornCore's whole suite
+\end{lstlisting}
+
+\code{BOARD} is \code{uno}, \code{mega2560} or \code{esp32}. The build is nornCore's
+Makefile with the tree passed in; \code{PORT}, \code{EXTRA\_CFLAGS}, \code{SIM\_SECONDS}
+and \code{CPU\_MHZ} pass through. On the AVR boards the Arduino bootloader takes the
+image over the serial port; on the ESP32 \code{esptool} writes it to flash offset
+\code{0x1000}, from where the ROM loads it directly.
+
+\section{An application}
+
+An application is a directory with its sources and two files:
+
+\begin{description}
+\item[\code{app.mk}] the default \code{BOARD}, the modules it uses (\code{MODULES}) and,
+  on the ESP32, which objects run from flash instead of IRAM (\code{FLASH\_OBJS}).
+\item[\code{rtos\_config.h}] the kernel configuration, started from
+  \code{config/rtos\_config.template.h} (chapter~\ref{ch:config}). Applications that
+  use nornNET or nornWIFI add \code{nn\_config.h} and \code{nw\_config.h}.
+\end{description}
+
+The kernel and the modules are compiled from source with exactly that configuration, so
+an application never links against a kernel built for another one. Should it happen
+anyway (a stale build directory), \code{rtos\_init} notices: every layout changing option
+is folded into \code{RTOS\_CONFIG\_SIGNATURE}, and a mismatch is
+\code{RTOS\_PANIC\_CONFIG} before any memory is touched.
+
+\section{The smallest application}
+
+\code{examples/hello} is one task that prints a line once a second and toggles the LED,
+with the idle hook counting idle loops and a panic hook that says what happened. It is
+also the skeleton of every nornRTOS application: hooks, \code{rtos\_init},
+\code{rtos\_createTask} for each task, \code{rtos\_start}.
+
+\lstinputlisting[caption={examples/hello/hello.c},label=lst:hello]{data/hello.c}
+
+Four things in it deserve a word.
+
+\begin{enumerate}
+\item The stack is a static array of \code{RTOS\_STACK\_DEFAULT} bytes (192 on the AVR,
+  1024 on the ESP32). The kernel fills it with a pattern at creation, and
+  \code{rtos\_getStackFree} or the stack monitor read the high water mark later
+  (section~\ref{sec:stacks}).
+\item \code{rtos\_waitPeriodic(RTOS\_MS(1000))} is a drift free period: each boundary is
+  the previous one plus the period, however long the task's work took. A late boundary
+  is counted as an overrun, not lost.
+\item The hooks are ordinary functions with weak defaults in the kernel:
+  \code{rtos\_idleHook}, \code{rtos\_panicHook}, \code{rtos\_stackWarnHook},
+  \code{rtos\_assertFailed}, \code{rtos\_traceHook}. Define the ones you want.
+\item \code{rtos\_start} never returns. The calling context becomes the idle task: it
+  runs the idle hook, the watchdog and the stack monitor when configured, and sleeps
+  until the next interrupt.
+\end{enumerate}
+
+\section{Hooks}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Hook & When \\
+\midrule
+\code{rtos\_idleHook()} & every iteration of the idle loop; must not block \\
+\code{rtos\_panicHook(pInfo)} & from \code{rtos\_panic}, interrupts disabled, before the halt or reset \\
+\code{rtos\_stackWarnHook(task, free)} & once per task whose untouched stack drops below \code{RTOS\_PORT\_STACK\_WARN} \\
+\code{rtos\_assertFailed(file, line)} & a failed \code{RTOS\_ASSERT}; must not return \\
+\code{rtos\_traceHook(event, a, b)} & every traced kernel event with \code{RTOS\_CFG\_TRACE}; interrupts disabled \\
+\bottomrule
+\end{tabularx}
+\caption{The hooks an application may define.}
+\end{table}
+
+A panic hook that prints the record is the one hook every application should have: the
+kernel's default is silent. \code{examples/semaphore} shows all of them.
+
+\section{The examples}
+
+\begin{description}
+\item[hello] one periodic task, the LED and the UART.
+\item[semaphore] two tasks, a semaphore, a software timer and a notification; every hook
+  defined.
+\item[basics] nornCore's tc01 as an application: a periodic task, events, a semaphore
+  given from an interrupt, a ceiling mutex, the stack check.
+\item[timing] tc04: switch time, interrupt latency and periodic jitter on the current
+  board, in microseconds.
+\item[bench] tc10: the kernel's cost in cycles (chapter~\ref{ch:perf}).
+\item[net] nornNET over QEMU's Ethernet device: DHCP, DNS, an HTTP GET.
+\item[wifi] nornWIFI on the ESP32 board: join an access point, DHCP, TCP.
+\end{description}
+
+Each prints a \code{RESULT <name> PASS} or \code{FAIL} line at the end and halts, which
+is how \code{make sim} knows it is done and how the test runner collects the results.

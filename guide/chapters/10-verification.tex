@@ -1,0 +1,82 @@
+\chapter{Verification}
+\label{ch:verify}
+
+Three layers of tests, all run by \code{make test} from the nornRTOS directory
+(\code{tools/test\_all.sh} in nornCore; about a minute with an ESP32 connected). Every
+regression run includes the host tests, simavr for both AVR boards, the ESP32 in QEMU,
+and the boards that are connected.
+
+\section{Host unit tests}
+
+The host port runs the kernel on \code{ucontext} with simulated ticks and simulated
+interrupts, so a test drives every primitive through a scripted sequence of calls and
+compares the trace of (task, event, value) with the expected one, deterministically.
+They are built with \code{-Wconversion}, AddressSanitizer and UndefinedBehaviorSanitizer.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Test & What it pins down \\
+\midrule
+\code{test\_kernel}    & three tasks through the scheduler, events, delays, periodic waits, semaphores, mutexes \\
+\code{test\_queue}     & queues and mailboxes: hand-over, overflow, timeouts, the ISR variants \\
+\code{test\_notify}    & task notifications and software timers, one shot and periodic \\
+\code{test\_pool}      & memory pools and the run time statistics \\
+\code{test\_features}  & heap, event groups, suspend and resume, the tickless query \\
+\code{test\_timeout}   & timeouts at the limit of 16 bit ticks: \code{RTOS\_MAX\_TIMEOUT} and beyond, \code{RTOS\_FOREVER - 1} \\
+\code{test\_wrap}, \code{test\_wrap32} & the tick counter running through four wraps (16 and 32 bits) with every timed primitive in use, each interval checked to the tick \\
+\code{test\_prio}      & the scheduler against mutex ceilings: an owner that blocked while holding, a waiter handed the mutex, nested ceilings \\
+\code{test\_tie}       & the scheduling order at equal effective priority (section~\ref{sec:tie}) in the task-context pick and in the interrupt tail \\
+\code{test\_lifecycle} & a task whose function returns is terminated and deaf; a reset slot starts a new task clean; a return while holding a mutex panics \\
+\code{test\_robust}    & deadlock, stack canary, task watchdog, timer task, statistics, task info, trace, assertion; one child process per scenario \\
+\code{test\_checks}    & every mandatory check with assertions compiled out, one child process per violation \\
+\code{test\_api}       & the contract test: every public function called as the header documents it, return values and statistics checked \\
+\code{test\_stress}    & six tasks pick random operations on every primitive with random timeouts while the idle hook injects random interrupts; the kernel invariants are checked after every operation; 8 seeds $\times$ 200\,000 ticks \\
+\bottomrule
+\end{tabularx}
+\caption{The host unit tests in \code{nornCore/test/}.}
+\end{table}
+
+\code{make host-cov} builds the host tests with gcov and reports the line coverage per
+kernel file: 98\,\% of the kernel, the rest being the reset paths of \code{rtos\_panic.c}
+that the host cannot take and the stack realignment only the ESP32 needs. \code{make
+analyze} runs GCC's static analyser over the kernel, the ports and the HAL with each
+architecture's compiler and reports nothing.
+
+\section{Test applications on the targets}
+
+Each test case checks its own counters at the end and prints \code{RESULT tcNN PASS} or
+\code{FAIL}, then halts, which ends a simulator run. tc01 to tc06 pass on a real Mega
+2560 with the same counters as simavr, on the ESP32 board and in QEMU.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Case & What it runs \\
+\midrule
+tc01 & periodic task, events, a semaphore from an ISR, a ceiling mutex, the stack check \\
+tc02 & a queue fed from an ISR with deliberate overflow, a mailbox between tasks \\
+tc03 & notifications from an ISR and from timers, one shot and periodic software timers \\
+tc04 & timing: context switch, interrupt latency, periodic jitter \\
+tc05 & panic, reset and recovery: an application panic, a stack overflow, a late task, a starved idle task; the record checked after each reset \\
+tc06 & floating point kept in registers across preemption; the lazy FPU context on the ESP32 \\
+tc07 & ESP32: a second kernel instance on the other core answering requests over the shared memory link \\
+tc08 & heap, event groups, suspend and resume, tickless idle together \\
+tc09 & ESP32: code and constants running from flash through the cache \\
+tc10 & the kernel benchmark in cycles (chapter~\ref{ch:perf}) \\
+tc11 & stack need per task \\
+tc12 & stack and interrupt entry latency against call depth \\
+\bottomrule
+\end{tabularx}
+\caption{The test applications in \code{nornCore/applications/}.}
+\end{table}
+
+\section{Continuous integration and the simulators}
+
+The host tests, simavr and QEMU run on every push. QEMU is not cycle accurate and stalls
+when the host is busy: its timing figures mean nothing, and a heavy parallel build on
+the host can fail the latency limits of tc04 and tc10. For stack use QEMU is exact. The
+rule for every change to the kernel is: tests first, then the change, then
+\code{tools/measure.sh} before and after, then the full regression.

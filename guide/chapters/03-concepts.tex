@@ -1,0 +1,362 @@
+\chapter{Concepts}
+\label{ch:concepts}
+
+This chapter is the model of the kernel: what a task is, when it runs, how time is
+counted, what an interrupt may do, and how mutual exclusion works. Everything in the
+later chapters assumes it.
+
+\section{Tasks and priorities}
+
+A task is a C function that never returns, running on a stack the application provides,
+with a priority that is also its identifier. There are \code{RTOS\_CFG\_NUM\_TASKS}
+application tasks, numbered 1 to \code{RTOS\_CFG\_NUM\_TASKS} (at most 31), and the idle
+task 0, which is the context that called \code{rtos\_start}. A higher number is a higher
+priority. Because the id is the priority, every kernel object that records waiting tasks
+does so as a bit mask (\code{rtos\_taskmask\_t}), and the highest waiter is the highest
+set bit.
+
+The task control block (TCB) holds the saved context, the stack, the pending event flags,
+the wait state, the timeout and the statistics; it is 42 bytes on the AVR and 72 on the
+ESP32 in the default configuration (figure~\ref{fig:ram}). The kernel adds nothing per
+task at run time.
+
+\section{Scheduling}
+\label{sec:sched}
+
+The scheduler keeps one \emph{ready mask} with a bit per task that is ready to run. The
+running task's bit stays set. The next task to run is the highest set bit: a lookup
+table on the AVR, one instruction on the Xtensa. A task that blocks clears its bit and
+the kernel switches to the highest remaining one; a task that is woken sets its bit, and
+if it is higher than the running task, the kernel switches to it at once (from task
+context) or at the end of the interrupt (from an ISR body).
+
+The rule an application can rely on:
+
+\begin{quote}
+At every instant the running task is the ready task with the greatest key
+$(\mathit{effPrio}, \mathit{boosted}, \mathit{prio})$, compared lexicographically. A
+ready task preempts the running one only if its key is strictly greater.
+\end{quote}
+
+Without mutexes the effective priority equals the priority, no task is boosted, and the
+rule reduces to \emph{the highest priority ready task runs}. The two other components
+matter only while a task holds a mutex whose ceiling is above its own priority
+(section~\ref{sec:mutex}); because priorities are unique, the order is total and no two
+tasks ever tie. There is no time slicing: a task runs until it blocks, is preempted by a
+higher task, or returns.
+
+The idle task runs when no other task is ready. It executes the idle hook, the watchdog
+and the stack monitor when they are configured, and then, with
+\code{RTOS\_CFG\_IDLE\_SLEEP}, puts the CPU to sleep until the next interrupt. With
+\code{RTOS\_CFG\_TICKLESS} on the ESP32 it also stops the tick and sleeps until the next
+deadline. The idle task must never block; a blocking call from it is checked.
+
+\section{Time}
+\label{sec:time}
+
+The tick is a periodic interrupt at \code{RTOS\_CFG\_TICK\_HZ}, 1\,kHz in every shipped
+configuration. It increments the tick counter, wakes the tasks whose timeout has
+expired (they are kept in a list sorted by wake-up time, so the tick looks at the head
+only) and runs the software timers that are due. \code{rtos\_getTick} returns the
+counter; it is 16 or 32 bits wide (\code{RTOS\_CFG\_TICK\_BITS}) and wraps, so tick
+values are always compared as differences, never directly. The kernel does the same, and
+that is what limits every finite timeout to half the counter's range,
+\code{RTOS\_MAX\_TIMEOUT}: 32767 ticks with 16 bit ticks, $2^{31}-1$ with 32. A longer
+timeout is checked; \code{rtos\_delay} is the one exception and splits a long delay into
+pieces.
+
+Two things in the semantics of time are easy to get wrong:
+
+\begin{itemize}
+\item \textbf{A delay of $n$ ticks lasts between $n$ and $n+1$ tick periods}, because
+  part of the current period is already over when the call is made. \code{rtos\_delay(0)}
+  waits for the next tick; it is not a yield (there is nothing to yield to: a task of the
+  same priority does not exist).
+\item \textbf{A periodic task does not drift.} \code{rtos\_waitPeriodic(period)} waits
+  for the next boundary, and each boundary is the previous one plus the period, not the
+  time of the call plus the period. If the boundary has passed, the call returns at once,
+  counts an overrun and starts the next period from now. A task whose first iteration
+  takes longer than a period therefore reports one overrun at start-up, harmlessly.
+\end{itemize}
+
+\code{rtos\_getTimeUs} is a finer clock, read from a free running hardware counter
+(4\,$\mu$s steps on the AVR, the cycle counter on the ESP32); it wraps after 71.6 minutes
+and is for measuring intervals.
+
+\section{Interrupts and calling contexts}
+\label{sec:contexts}
+
+An interrupt handler that talks to the kernel is written with the \code{RTOS\_ISR}
+macro:
+
+\begin{lstlisting}
+RTOS_ISR(BOARD_APP_TIMER_VECT)          /* a timer compare interrupt */
+{
+    rtos_semGiveFromIsr(&_sem);         /* wakes the consumer, no switch yet */
+}
+\end{lstlisting}
+
+On the AVR the macro produces a naked handler that saves the caller clobbered registers,
+runs the body and ends in the kernel's \emph{interrupt tail}: if the body made a higher
+task ready, the tail saves the rest of the context and switches, otherwise it returns to
+the interrupted task. On the ESP32 the macro defines the body as a function the port's
+exception dispatcher calls for that interrupt, and the tail is inlined into the
+dispatcher. In both cases the rule is the same: an ISR body never switches; \emph{the
+switch happens once, at the end of the ISR}. That is what makes several wake-ups in one
+interrupt cost one switch, and it is why there are separate \code{FromIsr} functions:
+they do the same work as the task variants but defer the switch.
+
+Interrupts do not nest on either port; a second interrupt waits and runs on the same
+spot. The longest interrupt-off window is therefore a context switch (about 27\,$\mu$s on
+the Mega, 1.7\,$\mu$s on the ESP32), and that is the worst case interrupt latency the
+benchmark in chapter~\ref{ch:perf} reports.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Context & May call \\
+\midrule
+Task & everything without a \code{FromIsr} suffix; a call may block or switch at once \\
+ISR body, timer callback in the tick, trace hook & the \code{FromIsr} variants,
+  \code{rtos\_timerStart}, \code{rtos\_timerStop}, \code{rtos\_getTick},
+  \code{rtos\_getTimeUs}, the readers (\code{rtos\_queueCount}, \code{rtos\_mboxIsFull},
+  \code{rtos\_poolFreeCount}, \code{rtos\_evgroupGet}, \code{rtos\_timerIsActive},
+  \code{rtos\_timerRemaining}) and \code{rtos\_panic}; nothing blocks or switches \\
+Idle task, idle hook & as a task, but nothing that blocks: waits only with
+  \code{RTOS\_NO\_WAIT}; a blocking call is checked \\
+Timer callback in the timer task & everything a task may call \\
+Panic hook & nothing of the kernel; interrupts are disabled \\
+\bottomrule
+\end{tabularx}
+\caption{Calling contexts.}
+\label{tab:contexts}
+\end{table}
+
+\paragraph{Critical sections.} The kernel's own critical sections are short interrupt-off
+windows (\code{rtos\_port\_enterCritical} returns the previous state,
+\code{rtos\_port\_exitCritical} restores it, so they nest). An application may use the
+same pair for a few instructions of its own; it costs three cycles on the AVR and six on
+the ESP32. Everything longer belongs behind a mutex or inside a single task.
+
+\section{Blocking and hand-over}
+
+Every blocking call takes a timeout: \code{RTOS\_NO\_WAIT} polls, \code{RTOS\_FOREVER}
+waits for good, anything else is ticks up to \code{RTOS\_MAX\_TIMEOUT}. A blocked task
+records what it waits on (\code{waitKind}, visible in \code{rtos\_getTaskInfo}) and, if
+it has a timeout, sits in the timed list.
+
+When a resource becomes available and a task waits for it, the kernel \emph{hands it
+over} directly: a semaphore token goes to the highest waiter without touching the count,
+a queue item is copied straight into the receiver's buffer, a freed pool block goes to
+the waiting allocator, a mutex is passed to the highest waiter who becomes the owner at
+once. The resource never passes through the shared state, so a lower task cannot sneak
+in between the release and the wake-up, and the waiter's return value is decided at the
+moment of the release. The woken task runs before the releasing call returns if it is
+higher.
+
+\section{Mutual exclusion}
+\label{sec:mutex}
+
+\subsection{The problem}
+
+A shared resource guarded by a plain lock produces \emph{priority inversion}: a high task
+$H$ blocks on a lock held by a low task $L$, and a medium task $M$ that needs neither
+preempts $L$ and keeps $H$ waiting for as long as it likes. The classic remedies are
+priority inheritance, where $L$ is raised to $H$'s priority once $H$ blocks, and the
+priority ceiling protocols, where the lock itself carries a priority~\cite{shaetal}.
+
+\subsection{The immediate priority ceiling protocol}
+
+nornCore implements the immediate variant, also known as the stack resource policy or
+highest locker protocol~\cite{baker,burnswellings}. Every mutex has a \emph{ceiling}: the
+highest priority of any task that will ever lock it. Locking the mutex raises the
+caller's \emph{effective priority} to the ceiling for as long as it holds the mutex;
+unlocking restores the previous one. The consequences, all of which the kernel relies
+on:
+
+\begin{itemize}
+\item \textbf{Nobody blocks on a mutex.} While $L$ holds the mutex it runs at the
+  ceiling, which is at least $H$'s priority, so $H$ cannot run and cannot find the mutex
+  locked. The lock operation is a priority change and a few stores: 218 cycles for a
+  lock and unlock pair on the Mega, 156 on the ESP32, with no scheduler involvement.
+\item \textbf{Inversion is bounded by one critical section.} $H$ can be delayed by at
+  most one lower task's critical section, and only one that was already running when $H$
+  became ready.
+\item \textbf{Deadlock is impossible} with correct ceilings: a task that holds one mutex
+  runs at a priority at which no other user of any mutex it will take next can hold it.
+\item \textbf{A medium task $M$ with priority below the ceiling is held off} while $L$
+  holds the mutex, even if $M$ never uses it. That is the price of the protocol and the
+  reason ceilings should be set exactly, not generously.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=0.9cm,y=0.9cm,font=\small]
+  % axes
+  \draw[-{Latex}] (0,0) -- (12.5,0) node[below left] {time};
+  \foreach \y/\n in {1/L (1),2/M (2),3/H (3)} {
+    \draw[gray!60] (0,\y) -- (12,\y);
+    \node[left] at (0,\y) {\n};
+  }
+  % L runs, locks at t=1 (raised to 3), unlocks at t=5
+  \fill[nornblue!30] (0,0.6) rectangle (1,1.4);
+  \fill[nornblue!60] (1,2.6) rectangle (5,3.4);
+  \draw[dashed] (1,1.4) -- (1,2.6);
+  \draw[dashed] (5,2.6) -- (5,1.4);
+  \node[above,font=\footnotesize] at (3,3.4) {L holds the mutex at the ceiling 3};
+  % H ready at t=2, runs at t=5
+  \draw[-{Latex},nornred,thick] (2,4.2) -- (2,3.5) node[midway,right,font=\footnotesize] {H ready};
+  \fill[nornred!50] (5,2.6) rectangle (7.5,3.4);
+  \node[above,font=\footnotesize] at (6.25,3.4) {H};
+  % M ready at t=3, runs after H
+  \draw[-{Latex},black!70,thick] (3,4.2) -- (3,3.5) node[midway,right,font=\footnotesize] {M ready};
+  \fill[gray!40] (7.5,1.6) rectangle (9.5,2.4);
+  \node[above,font=\footnotesize] at (8.5,2.4) {M};
+  \fill[nornblue!30] (9.5,0.6) rectangle (11,1.4);
+  \node[above,font=\footnotesize] at (10.25,1.4) {L};
+  \foreach \x in {0,1,...,12} \draw (\x,-0.1) -- (\x,0.1);
+\end{tikzpicture}
+\caption{Immediate priority ceiling. L (priority 1) locks a mutex with ceiling 3 at $t=1$
+and runs at 3 until the unlock at $t=5$. H (3) and M (2) become ready meanwhile and
+wait; H is delayed by one critical section of L and by nothing else, and M, which never
+uses the mutex, is held off as long as L holds it. Nobody ever blocks on the mutex
+itself.}
+\label{fig:ceiling}
+\end{figure}
+
+\subsection{When the ceiling is wrong, or the owner blocks}
+
+Two things break the ideal picture. A ceiling that is \emph{too low} (a task above the
+ceiling locks the mutex) is a configuration error; the lock is asserted against it, and
+without assertions the task finds the mutex held. And an owner may \emph{block while
+holding} the mutex (allowed, discouraged): it then leaves the CPU at the ceiling, and a
+task above its base priority but at or below the ceiling can run and try the lock.
+
+For both cases the kernel has a fallback: the caller waits on the mutex, without a
+timeout, and the unlock hands the mutex to the highest waiter, who becomes the owner at
+the ceiling at once. A wait that would close a cycle of tasks waiting for each other's
+mutexes is detected and is \code{RTOS\_PANIC\_DEADLOCK}, naming both tasks. The detector
+follows chains of mutex waits only, which is why a task must not return while holding a
+mutex (section~\ref{sec:lifecycle}): an owner that is gone would make every later lock
+wait for ever without a cycle to detect.
+
+\subsection{The order at equal effective priority}
+\label{sec:tie}
+
+While a task holds a mutex at the ceiling $c$, the task whose base priority is $c$ may
+become ready. Both have effective priority $c$. The scheduling key from
+section~\ref{sec:sched} settles it: the \emph{boosted} owner ranks above the task whose
+base priority is the ceiling, so the owner finishes its critical section first and the
+higher task does not preempt it. This is the choice that preserves the protocol's
+promise that nobody blocks: were the task at the ceiling to preempt, it would find the
+mutex locked. Two owners at one ceiling, which is possible only if one of them blocked
+while holding, run in base priority order. The test \code{test/test\_tie.c} pins every
+one of these cases down.
+
+\subsection{Rules for using mutexes}
+
+\begin{enumerate}
+\item Set the ceiling to the highest priority of any task that locks the mutex, exactly.
+\item Keep the critical section short; nothing below the ceiling runs meanwhile.
+\item Do not block while holding a mutex. It is allowed, and the kernel copes, but it
+  reintroduces waiting and it is the only way to get two tasks at one ceiling.
+\item Lock in a fixed order and unlock in the reverse order (asserted). A mutex is not
+  recursive (asserted).
+\item Never return from a task function while holding a mutex (checked for every mutex
+  whose ceiling is above the task's priority).
+\item Do not lock from the idle task (asserted) or from an ISR body: an ISR body cannot
+  wait, and a critical section is the right tool for a few instructions of shared state
+  with an interrupt.
+\end{enumerate}
+
+\section{The task life cycle}
+\label{sec:lifecycle}
+
+A task slot is in one of five states, derived from the TCB rather than stored in it (no
+state byte, no store on the hot path), with suspension as a modifier on top of READY and
+BLOCKED:
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lXll@{}}
+\toprule
+State & Predicate & Entered by & Left by \\
+\midrule
+UNUSED     & no task function; the TCB is in its initial state & \code{rtos\_init}, a future reap & \code{rtos\_createTask} \\
+READY      & bit in the ready mask, not the running task & create, wake-up, preemption & pick, block, suspend \\
+RUNNING    & the current task (its bit stays in the ready mask) & pick & block, preemption, return \\
+BLOCKED    & bit not in the ready mask; \code{waitKind} says on what & a blocking call & wake-up, timeout \\
+TERMINATED & \code{waitKind == RTOS\_WAIT\_TERMINATED} & the task function returning & a future reap \\
+\bottomrule
+\end{tabularx}
+\caption{The task states. \code{rtos\_getTaskInfo} reports them as \code{RTOS\_TASK\_*},
+with SUSPENDED for a suspended READY or BLOCKED task.}
+\label{tab:states}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\small, node distance=2.2cm and 2.6cm,
+  state/.style={draw, rounded corners, minimum width=2.3cm, minimum height=0.8cm, fill=codebg},
+  >={Latex[length=2mm]}]
+  \node[state] (unused) {UNUSED};
+  \node[state, right=of unused] (ready) {READY};
+  \node[state, right=of ready] (running) {RUNNING};
+  \node[state, below=of running] (blocked) {BLOCKED};
+  \node[state, below=of ready] (term) {TERMINATED};
+  \draw[->] (unused) -- node[above] {createTask} (ready);
+  \draw[->] (ready.north east) to[bend left=20] node[above] {pick} (running.north west);
+  \draw[->] (running.south west) to[bend left=20] node[below] {preempted} (ready.south east);
+  \draw[->] (running) -- node[right] {blocking call} (blocked);
+  \draw[->] (blocked) -- node[below, sloped] {wake-up, timeout} (ready);
+  \draw[->] (running) -- node[above, sloped, pos=0.6] {function returns} (term);
+  \draw[->, dashed] (term) -- node[left, text width=1.9cm, align=center] {reap\\(future)} (unused);
+\end{tikzpicture}
+\caption{The life cycle of a task slot. Suspension (\code{rtos\_suspend}) is a modifier
+on READY and BLOCKED, not a state: the task keeps its wait and its pending wake-ups and
+continues at \code{rtos\_resume}.}
+\label{fig:states}
+\end{figure}
+
+A task function \emph{should} never return. If it does, the task is terminated: its slot
+and stack stay allocated, it is never scheduled again, and it is deaf to events,
+notifications, suspends and resumes aimed at it (they accumulate or are ignored
+harmlessly). Returning while holding a mutex is checked, for the reason given above. The
+kernel does not yet reuse a terminated slot at run time; the rules under which a future
+dynamic task API will do so are fixed (appendix~\ref{app:roadmap}), and the test
+\code{test/test\_lifecycle.c} already verifies them against the kernel.
+
+\section{Stacks}
+\label{sec:stacks}
+
+Each task runs on the stack given to \code{rtos\_createTask}. What a task needs is its
+own frames plus what the kernel and the port leave under them when the task blocks or is
+interrupted. An interrupt lands on the stack of the running task, so every task must
+have room for the interrupt frame and the kernel's work on top of its own deepest call
+chain. The port gives three sizes (table~\ref{tab:stacksizes}), and chapter~\ref{ch:perf}
+has the measurements they are derived from.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lrrX@{}}
+\toprule
+Name & ESP32 & AVR & Meant for \\
+\midrule
+\code{RTOS\_STACK\_MIN}     & 512 B  & 96 B  & the technical minimum the kernel accepts (checked): very simple tasks whose use has been measured \\
+\code{RTOS\_STACK\_DEFAULT} & 1024 B & 192 B & an ordinary task; start here \\
+\code{RTOS\_STACK\_LARGE}   & 2048 B & 384 B & a recommended start for tasks that print, nest calls or use floating point; not an upper bound \\
+\bottomrule
+\end{tabularx}
+\caption{The stack sizes the port names. Size a task from the default, run it, read the
+high water mark with \code{rtos\_getStackFree}, and keep a margin above
+\code{RTOS\_PORT\_STACK\_WARN} (96 B on the ESP32, 24 B on the AVR).}
+\label{tab:stacksizes}
+\end{table}
+
+With \code{RTOS\_CFG\_STACK\_CHECK} the stack is filled with a pattern at creation and
+the high water mark can be read; with \code{RTOS\_CFG\_STACK\_WARN} the idle task
+watches one task per loop and calls \code{rtos\_stackWarnHook} once for a task whose
+margin is gone; with \code{RTOS\_CFG\_STACK\_CHECK 2} a canary at the bottom turns an
+actual overflow into \code{RTOS\_PANIC\_STACK\_OVERFLOW}, checked before every switch and
+at every tick.
