@@ -1,0 +1,30 @@
+\chapter{Towards dynamic tasks}
+\label{app:roadmap}
+
+nornCore is a static kernel by design, and the team decided in November 2026 to prepare
+for creating and deleting tasks at run time by formalising the life cycle first
+(section~\ref{sec:lifecycle}) rather than by adding a scheduler feature. The plan is
+\code{doc/dynamic\_tasks\_plan.md} in nornCore; this is its outline so that a reader
+of this guide knows what to expect.
+
+\paragraph{Done.} The scheduling order with a held mutex is a total order on a
+documented key; the running task's own boost costs nothing on the hot path; a task whose
+function returns is \code{RTOS\_TASK\_TERMINATED}, deaf and checked against holding a
+mutex; one function produces the initial state of a task slot, used by \code{rtos\_init}
+today and by the reap tomorrow. The test \code{test\_lifecycle} exercises all of it,
+including a slot reset and re-created under a critical section.
+
+\paragraph{Remaining, in order.} A public \code{rtos\_exit()} so that a task can end
+without returning through its whole call chain; a count of held mutexes in the TCB,
+which closes the one hole in the exit check (a mutex whose ceiling equals the owner's
+priority raises nothing); a reap callable on a terminated task only, from another
+context, with a port hook that frees the stack where a port allocated one; a run time
+create that wraps \code{rtos\_createTask} in a critical section and a schedule; and a
+configuration option, off by default, under which all of it is compiled, with the proof
+that a static system's kernel is byte for byte the one it is today.
+
+\paragraph{Never.} Killing a READY, BLOCKED or RUNNING task from outside: the task may
+sit in the timed list, in waiter masks, own a mutex or be executing on the very stack
+that would be freed, and that operation is behind most use-after-free bugs in kernels
+that offer it. Task ids stay equal to priorities; a reused slot gives the new task the
+priority of the slot.

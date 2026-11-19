@@ -1,0 +1,265 @@
+\chapter{Using the primitives}
+\label{ch:primitives}
+
+nornCore offers more than one way to signal and to share. This chapter says what each
+primitive is for, how it behaves at the edges, and shows the idiom. The formal contracts
+are in chapter~\ref{ch:api}; the costs in chapter~\ref{ch:perf}.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lXl@{}}
+\toprule
+Need & Primitive & Cost, Mega / ESP32 \\
+\midrule
+wake one task, no data & task notification (\code{rtos\_notify}) or event flags & 220 / 145, 217 / 140 \\
+count occurrences, producer to consumer & counting semaphore, or \code{RTOS\_NOTIFY\_INC} & 145 / 112 \\
+hand a small record to another task, in order & message queue & 453 / 285 \\
+the latest value only, overwrite is fine & mailbox & 282 / 194 \\
+flags several tasks wait on & event group & 272 / 137 \\
+protect shared data between tasks & ceiling mutex & 218 / 156 \\
+fixed size buffers, bounded time & memory pool & 487 / 176 \\
+variable size, rarely, at start-up & heap & -- \\
+run something later or periodically without a task & software timer & 241 / 124 \\
+\bottomrule
+\end{tabularx}
+\caption{Which primitive for which need. The costs are cycles for one call pair without a
+switch (tc10, \measDate).}
+\label{tab:which}
+\end{table}
+
+\section{Task event flags}
+
+Every task owns \code{RTOS\_CFG\_EVT\_BITS} private event flags. Anyone posts
+(\code{rtos\_postEvents}, \code{rtos\_postEventsFromIsr}, \code{rtos\_broadcastEvents}),
+only the owner waits. Events posted earlier stay pending until a wait consumes them, so
+nothing is lost between two waits; the wait returns the events that satisfied it and
+clears those, leaving other pending events alone.
+
+\begin{lstlisting}
+#define EVT_SAMPLE  0x01u
+#define EVT_BUTTON  0x02u
+
+static void controller(void *arg)
+{
+    for(;;)
+    {
+        const rtos_evt_t got = rtos_waitEvents(EVT_SAMPLE | EVT_BUTTON, RTOS_WAIT_ANY, RTOS_MS(500));
+        if(got == 0)            /* timeout: nothing in 500 ms */
+            handleSilence();
+        if(got & EVT_SAMPLE)
+            processSample();
+        if(got & EVT_BUTTON)
+            handleButton();
+    }
+}
+
+RTOS_ISR(ADC_vect)
+{
+    rtos_postEventsFromIsr(TASK_CONTROLLER, EVT_SAMPLE);
+}
+\end{lstlisting}
+
+\code{RTOS\_WAIT\_ALL} waits for every bit of the mask. Event flags are the right tool
+when one task is the hub of several sources; they carry no data and do not count.
+
+\section{Counting semaphores}
+
+A semaphore counts tokens. \code{rtos\_semGive} adds one, or hands it directly to the
+highest waiting task; \code{rtos\_semTake} takes one or waits. \code{RTOS\_SEM\_INIT(n)}
+makes a semaphore without an upper limit, \code{RTOS\_SEM\_INIT\_BINARY(n)} one whose
+count never exceeds one (a give while the token is available is dropped and counted in
+the \code{lost} field), \code{RTOS\_SEM\_INIT\_MAX(n, max)} one with any limit. The
+typical use is an interrupt producing and a task consuming:
+
+\begin{lstlisting}
+static rtos_sem_t _rxReady = RTOS_SEM_INIT(0);
+
+RTOS_ISR(USART0_RX_vect)
+{
+    _rxBuf[_rxIn++ & RX_MASK] = UDR0;
+    rtos_semGiveFromIsr(&_rxReady);
+}
+
+static void reader(void *arg)
+{
+    for(;;)
+        if(rtos_semTake(&_rxReady, RTOS_FOREVER))
+            consume(_rxBuf[_rxOut++ & RX_MASK]);
+}
+\end{lstlisting}
+
+The semaphore here is only the count; the data travels in the application's own ring. A
+semaphore is not a lock: there is no owner and no priority ceiling, and using one for
+mutual exclusion brings back the priority inversion the mutex exists to prevent.
+
+\section{Ceiling mutexes}
+
+A mutex protects shared data between tasks. Its one parameter is the ceiling, the highest
+priority of any task that will lock it (section~\ref{sec:mutex}).
+
+\begin{lstlisting}
+#define TASK_LOG     1
+#define TASK_SENSOR  2
+#define TASK_CTRL    4
+
+static rtos_mutex_t _stateLock = RTOS_MUTEX_INIT(TASK_CTRL);   /* highest user */
+static struct state _state;
+
+static void sensor(void *arg)        /* priority 2 */
+{
+    for(;;)
+    {
+        (void)rtos_waitPeriodic(RTOS_MS(10));
+        const int16_t t = readTemperature();
+        rtos_mutexLock(&_stateLock);     /* runs at 4 until the unlock */
+        _state.temperature = t;
+        rtos_mutexUnlock(&_stateLock);
+    }
+}
+\end{lstlisting}
+
+While the sensor task holds the lock it runs at priority 4, so the controller (4) cannot
+preempt it and find the state half written, and the logger (1) is unaffected. The
+critical section is a few stores; keep it that way. Do not call anything that may block
+inside it.
+
+\section{Message queues}
+
+A queue is a FIFO of fixed size items copied by value, with blocking send and receive and
+non-blocking \code{FromIsr} variants. A send to a queue with a blocked receiver copies
+the item straight into the receiver's buffer. A full queue makes the sender wait or, with
+\code{RTOS\_NO\_WAIT} or from an interrupt, fail; failed sends are counted in the
+\code{dropped} field, and the high water mark in \code{maxCount}, so a queue sized too
+small is visible.
+
+\begin{lstlisting}
+typedef struct { uint8_t channel; uint16_t value; } sample_t;
+
+static uint8_t      _qStore[8 * sizeof(sample_t)];
+static rtos_queue_t _q = RTOS_QUEUE_INIT(_qStore, sizeof(sample_t), 8);
+
+RTOS_ISR(BOARD_APP_TIMER_VECT)
+{
+    sample_t s = { .channel = ADMUX & 0x0F, .value = ADC };
+    (void)rtos_queueSendFromIsr(&_q, &s);        /* false if full: counted as dropped */
+}
+
+static void worker(void *arg)
+{
+    sample_t s;
+    for(;;)
+        if(rtos_queueReceive(&_q, &s, RTOS_MS(100)))
+            process(&s);
+        else
+            noSampleFor100ms();
+}
+\end{lstlisting}
+
+Items are copied twice (in and out), so a queue of large items is better replaced by a
+queue of pointers into a memory pool.
+
+\section{Mailboxes}
+
+A mailbox is a queue of depth one in which a post never blocks and overwrites an unread
+item (counted in \code{overwrites}). It carries \emph{the latest value}: a setpoint, a
+measurement, a state that only the newest matters of. A reader blocks until something is
+posted. Use it where a queue would only fill with stale data.
+
+\section{Task notifications}
+
+The cheapest signal: one 16 bit value per task and no object. \code{rtos\_notify}
+replaces, ORs into or increments the value and wakes the task if it waits;
+\code{rtos\_notifyWait} takes the whole value, \code{rtos\_notifyTake} waits for a
+non-zero value and decrements it, which with \code{RTOS\_NOTIFY\_INC} on the sending side
+is a counting semaphore without a semaphore. A task should use one of the two wait styles,
+since they share the value. Notifications are the fastest switch on both boards
+(figure~\ref{fig:switch}).
+
+\begin{lstlisting}
+RTOS_ISR(DMA_DONE_vect)
+{
+    rtos_notifyFromIsr(TASK_DMA, 1, RTOS_NOTIFY_INC);
+}
+
+static void dmaTask(void *arg)
+{
+    for(;;)
+        if(rtos_notifyTake(RTOS_FOREVER))
+            handleCompletion();
+}
+\end{lstlisting}
+
+\section{Software timers}
+
+A software timer calls a function after a delay, once or periodically, without a task of
+its own. With \code{RTOS\_CFG\_TIMER\_TASK\_PRIO 0} the callback runs in the tick
+interrupt with interrupts disabled: keep it short and use only the ISR body functions.
+With a timer task configured, the callback runs in that task and may use the whole API,
+at the price of a task slot and its stack.
+
+\begin{lstlisting}
+static rtos_timer_t _blink;
+
+static void blinkCb(void *arg)
+{
+    gpio_toggle(&_led);                  /* ISR body: no blocking, no switch */
+}
+
+/* in a task or in main() before rtos_start: */
+rtos_timerInit(&_blink, blinkCb, NULL);
+rtos_timerStart(&_blink, RTOS_MS(500), RTOS_MS(500));   /* first in 500 ms, then every 500 ms */
+\end{lstlisting}
+
+The first expiry is on the \code{delay}-th tick from now (so after $\mathit{delay}-1$ to
+$\mathit{delay}$ periods); later expiries are exactly \code{period} ticks apart, counted
+from the previous expiry, so a periodic timer does not drift. A delay of 0 means the next
+tick, which lets a callback restart its own timer. The active timers are a list sorted
+by expiry; \code{rtos\_timerStart} spends time proportional to their number with
+interrupts off.
+
+\section{Memory pools}
+
+A pool hands out fixed size blocks from storage the application owns, in constant time,
+with a wait for a free block if wanted and a \code{FromIsr} variant that does not wait.
+\code{rtos\_poolFree} checks that the block belongs to the pool and lies on a block
+boundary. The low water mark \code{minFree} and the count of failed allocations
+\code{failed} show whether the pool is sized right. A pool is what a driver uses for
+packet buffers and what a queue of pointers refers to; it is the bounded time
+alternative to the heap.
+
+\begin{lstlisting}
+static uint8_t     _frames[6 * 64];
+static rtos_pool_t _framePool = RTOS_POOL_INIT(_frames, 64, 6);
+/* rtos_poolInit(&_framePool, _frames, 64, 6) must still be called before use */
+
+uint8_t *p = rtos_poolAlloc(&_framePool, RTOS_MS(10));
+if(p != NULL) { fill(p); rtos_queueSend(&_frameQ, &p, RTOS_FOREVER); }
+\end{lstlisting}
+
+\section{Event groups}
+
+An event group is a set of flags shared by any number of tasks
+(\code{RTOS\_CFG\_EVGROUPS}). Where task event flags belong to one task, a group lets
+several tasks wait for the same conditions: ``link up and address assigned'', say.
+\code{rtos\_evgroupSet} wakes every waiter whose condition is now met, highest first; a
+waiter that asked for \code{RTOS\_WAIT\_CLEAR} takes its bits out of the group as it is
+woken, so a lower waiter no longer sees them. Without it the bits stay set for everyone
+until \code{rtos\_evgroupClear}.
+
+\section{Suspend and resume}
+
+\code{rtos\_suspend} keeps a task from running until \code{rtos\_resume}, whatever it was
+doing. A blocked task stays in its wait; a wake-up that arrives meanwhile is kept and
+takes effect at the resume. There is no nesting count, and a suspended task keeps the
+mutexes it holds, which is the reason to suspend only tasks that are known to hold none.
+Suspension is for modes (``the display task is off while the lid is closed''), not for
+synchronisation; the primitives above are.
+
+\section{The heap}
+
+\code{RTOS\_CFG\_HEAP} compiles a first fit allocator with coalescing over an area the
+application gives it (\code{rtos\_heapInit}). \code{rtos\_malloc} searches the free list
+with interrupts disabled, so its time grows with fragmentation; it is meant for
+start-up allocations and for modules whose binary libraries need an allocator
+(nornWIFI), not for the data path. \code{rtos\_heapStats} reports the low water mark and
+the largest free block.

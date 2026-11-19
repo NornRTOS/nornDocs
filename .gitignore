@@ -1,0 +1,12 @@
+api/
+guide/*.aux
+guide/*.log
+guide/*.out
+guide/*.toc
+guide/*.idx
+guide/*.ind
+guide/*.ilg
+guide/*.fls
+guide/*.fdb_latexmk
+guide/*.synctex.gz
+guide/chapters/*.aux
