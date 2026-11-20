@@ -1,0 +1,4 @@
+path,megamin,megaavg,megamax,espmin,espavg,espmax
+sem,471,488,826,418,418,765
+notify,486,501,834,445,446,792
+notify; ceiling held,493,511,719,449,480,814

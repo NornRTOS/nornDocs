@@ -1,0 +1,292 @@
+\chapter{Robustness and diagnostics}
+\label{ch:robust}
+
+A kernel for a device that runs unattended has to answer two questions: what does it do
+when the application breaks a rule, and how does the engineer find out what happened. The
+answers in nornCore are a small number of mandatory checks, a panic record that survives
+a reset, and a set of diagnostics that read the kernel's own bookkeeping.
+
+\section{Checks and assertions}
+
+Every public function that takes a task id, a storage pointer, a stack size or a timeout
+validates it with \code{RTOS\_CHECK}, in every configuration. A violation is a
+\emph{panic} with \code{RTOS\_PANIC\_ARGUMENT} and the two offending values in the record;
+there is no error return for an argument that would corrupt memory, because a return
+value is what the caller that made the mistake would ignore. Contracts whose violation
+costs more to detect than it is worth in a release build are \code{RTOS\_ASSERT}ed
+instead and compiled only with \code{RTOS\_CFG\_ASSERT}: recursive locks, the unlock
+order, a lock from the idle task, an empty event mask. Chapter~\ref{ch:api} marks every
+entry \emph{checked} or \emph{asserted}.
+
+\section{Panic and the record}
+
+\code{rtos\_panic(reason, arg1, arg2)} disables interrupts, writes a record (reason,
+running task, tick, the two arguments, and for an assertion the file and line) into
+memory that survives a reset, calls \code{rtos\_panicHook} and then halts
+(\code{RTOS\_CFG\_PANIC\_ACTION 0}) or resets the board (1). After a reset,
+\code{rtos\_init} takes the record out of that memory and \code{rtos\_getLastPanic}
+returns it once; \code{rtos\_getResetCause} says what the hardware thinks happened
+(power on, external, brown out, watchdog, software).
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Reason & Meaning, \code{arg1} / \code{arg2} \\
+\midrule
+\code{RTOS\_PANIC\_ASSERT}         & a failed \code{RTOS\_ASSERT}; file and line in the record \\
+\code{RTOS\_PANIC\_STACK\_OVERFLOW} & the canary of task \code{arg1} was overwritten (\code{STACK\_CHECK 2}) \\
+\code{RTOS\_PANIC\_WATCHDOG}       & task \code{arg1} did not check in; \code{RTOS\_NO\_TASK}: the idle task \\
+\code{RTOS\_PANIC\_DEADLOCK}       & task \code{arg1} would wait for a mutex held, through a chain, by itself; \code{arg2} the owner \\
+\code{RTOS\_PANIC\_FAULT}          & a CPU exception; cause and address from the port \\
+\code{RTOS\_PANIC\_CONFIG}         & the application's and the kernel's configuration signatures differ \\
+\code{RTOS\_PANIC\_ARGUMENT}       & a mandatory check refused an argument; the values \\
+\code{RTOS\_PANIC\_APPLICATION}    & \code{rtos\_panic} called by the application; its own arguments \\
+\bottomrule
+\end{tabularx}
+\caption{Panic reasons.}
+\label{tab:panic}
+\end{table}
+
+tc05 provokes four of these in turn on the boards (an application panic, a stack
+overflow, a late task, a starved idle task), lets each reset the board, and checks the
+record after every reset.
+
+\section{Stack checking}
+
+Section~\ref{sec:stacks} has the sizes; this is the machinery. With
+\code{RTOS\_CFG\_STACK\_CHECK} the stack is filled with a pattern at creation and
+\code{rtos\_getStackFree} counts the untouched bytes from the bottom: the high water
+mark since the start. With \code{RTOS\_CFG\_STACK\_WARN} the idle task reads one task's
+mark per loop and calls \code{rtos\_stackWarnHook} once for a task whose margin drops
+below \code{RTOS\_PORT\_STACK\_WARN}. With \code{STACK\_CHECK 2} a canary at the bottom
+is checked before every context switch and at every tick, and an overwritten canary is
+\code{RTOS\_PANIC\_STACK\_OVERFLOW}. The canary catches an overflow after the fact; the
+monitor warns before it. On the ESP32, \code{RTOS\_CFG\_STACK\_GUARD} adds a hardware
+guard: a data breakpoint on the lowest 32 bytes of the running task's stack, armed at
+every context switch, so the first store there is the panic at that very instruction
+(\code{arg2} is its PC), also inside a critical section and before anything below the
+stack is touched. It costs two special register writes per switch (8 cycles measured)
+and 32 byte stack alignment; the canary stays as the second line for a frame that steps
+over the window. The AVR has no such hardware. None of this is memory protection: there
+is no MPU isolation and no privilege separation in nornCore, by design (design.md,
+"What is deliberately absent").
+
+\section{The watchdog}
+
+\code{RTOS\_CFG\_WATCHDOG} arms the hardware watchdog (\code{rtos\_wdtInit}) and lets the
+idle task kick it, but only after checking that every monitored task
+(\code{rtos\_wdtMonitor}) has called \code{rtos\_wdtCheckIn} within its interval. A late
+task is \code{RTOS\_PANIC\_WATCHDOG} with a record; a starved idle task, which means a
+runaway task or an interrupt storm, lets the hardware reset the board without one, and
+the next boot sees \code{RTOS\_RESET\_WATCHDOG}. The two cases together cover both ways
+a system can hang.
+
+\section{Deadlock detection}
+
+A mutex wait that would close a cycle (A waits for a mutex B holds while B waits for one
+A holds, through any number of tasks) is detected at the moment of the wait and is
+\code{RTOS\_PANIC\_DEADLOCK}. With correct ceilings a wait never happens, so the detector
+is a safety net for a wrong ceiling or an owner that blocked while holding.
+
+\section{Run time statistics and task information}
+
+\code{RTOS\_CFG\_RUNTIME\_STATS} measures the time each task runs, at every switch, in
+counts of \code{RTOS\_RUNTIME\_HZ}. \code{rtos\_getTaskRunTime} returns a task's total,
+\code{rtos\_getCpuLoad} the share of time not spent in the idle task since the previous
+call. \code{rtos\_getTaskInfo} is the snapshot for a console or a debugger: state,
+priority and effective priority, what the task waits on and until when, stack size and
+free, run time, overruns. \code{rtos\_getOverrunCount} reads and optionally resets a
+periodic task's overruns. The kernel objects also carry their own statistics: lost gives
+on a semaphore, dropped sends and the high water mark on a queue, overwrites on a mailbox,
+failed allocations and the low water mark on a pool, the heap's statistics.
+
+\section{A console into the system: nosh}
+\label{sec:nosh}
+
+nornSHELL (nosh) is an optional module that puts the diagnostics above on a command
+line: a prompt on a UART, or on anything else that moves bytes, with \code{ps},
+\code{mem}, \code{sched} and \code{uptime}. It is built on the public API only
+(\code{rtos\_getTaskInfo}, \code{rtos\_getCpuLoad}, \code{rtos\_heapStats},
+\code{rtos\_getLastPanic}, \code{rtos\_getResetCause}, \code{rtos\_getTick}), and the
+kernel was not changed for it. An application that does not enable it links the same
+kernel objects to the byte: the compilers put every function in its own section and the
+linker drops what nothing references, which the nornRTOS tree checks on every push
+(\code{tools/size\_check.sh}). The same mechanism makes the commands optional one by
+one: a command the application does not register is not in the image.
+
+\begin{lstlisting}
+#include "nosh.h"
+
+static const char *const names[] = { "idle", "nosh", "blink" };
+
+int main(void)
+{
+    rtos_init();
+    RTOS_TASK(2, blink, NULL, RTOS_STACK_DEFAULT);
+    nosh_enableUart(1);                   /* the console UART, help uptime ps mem sched */
+    nosh_setTaskNames(names, 3);          /* the kernel has no names */
+    rtos_start();
+}
+\end{lstlisting}
+
+\code{nosh\_enableUart} is the console UART as the transport with the default set of
+commands: with \code{UART\_CFG\_RX\_STREAM} in \code{rtos\_config.h} the driver's receive
+interrupt writes into a stream buffer the shell sleeps on (AVR and ESP32), otherwise a
+receive callback into a queue on the ESP32 and polling on the AVR; an application
+with another transport fills a \code{nosh\_io\_t} of two functions, read and write, and
+calls \code{NOSH\_ENABLE} or \code{nosh\_enableDefault} with it.
+
+\code{NOSH\_ENABLE} alone gives \code{help}; \code{nosh\_add(\&nosh\_cmd\_ps)} and the
+others pick commands, and a command of another module (a configuration store's
+\code{config}, say, nornNET's \code{net}, nornWIFI's \code{wifi}) is registered the same
+way, so modules never depend on each other: a module compiles its command only when the
+shell is among the application's modules, and an application without the shell gets the
+module byte for byte as before. nornCore's log classes (\code{hal/log.h}: \code{LOG\_E},
+\code{LOG\_W}, \code{LOG\_I}, \code{LOG\_D} around the UART calls, a line
+\code{I (12345) text}) have a run time level that the shell's \code{log} command sets
+and that a configuration store can keep; a module can have a level of its own
+(\code{LOG\_MODULE}; \code{log wifi warning} quietens nornWIFI's radio alone), a class
+that is off costs one compare, and a compile time cap keeps DEBUG out of the image until
+an application asks for it. Lines from two tasks may interleave unless
+\code{LOG\_CFG\_LOCK} serializes them with a binary semaphore.
+
+With \code{RTOS\_CFG\_DYNAMIC\_TASKS} (section~\ref{sec:dyntasks} in the API chapter)
+the shell also starts and ends tasks: a \emph{program} is a task the application lists in
+a \code{nosh\_program\_t} table (name, slot, function, a stack it owns) instead of
+creating it in \code{main()}; \code{run work} starts it, \code{stop work} raises a flag
+the program reads with \code{nosh\_stopRequested()} and ends itself on, and
+\code{wait work} waits for the end and frees the slot and the stack for the next run,
+and \code{restart work} does the three in one; a task that still owns a mutex is noted,
+since it cannot end before it has released it.
+Nothing is ended from outside. The commands (\code{nosh\_cmd\_run},
+\code{nosh\_cmd\_stop}, \code{nosh\_cmd\_wait}) are registered like the others, and
+without the kernel option registering one is a link error that names the option.
+The transport is two functions: \code{read} returns the bytes available, or nothing, in
+which case the shell sleeps \code{NOSH\_CFG\_POLL\_MS} before asking again; it may also
+block the shell task on a queue fed by a receive interrupt, which costs nothing while
+idle. \code{write} may block the shell task but never a task above it. The shell's
+priority is the application's, like every other task's, and \code{nosh\_enable} refuses
+a slot that is taken. \code{examples/shell} in nornRTOS shows both transports with
+nornCore's UART driver.
+
+\begin{lstlisting}
+nosh> ps
+ id name      st prio wait      left  stack      cpu ms  ovr
+  0 idle      r  0    -            -          -     380    0
+  1 nosh      R  1    -            -  1024/ 724       2    0
+  2 blink     B  2    period     457  1024/ 772       0    0
+nosh> mem
+stacks  2 tasks 2048 B, 1524 untouched, least margin 752 B in 1 (nosh)
+heap    - (RTOS_CFG_HEAP 0)
+nosh> sched
+load    2 % since last sched
+tasks   2 of 4 slots: 1 running 0 ready 1 blocked 0 suspended 0 terminated
+tick    1000 Hz, 32 bit; timers in the tick; switches -
+panic   none
+\end{lstlisting}
+
+A column whose option is off in \code{rtos\_config.h} (stack check, run time statistics,
+the heap) shows a dash and says which option. Everything the shell prints is stored in
+program memory on the AVR; a command's strings go through \code{NOSH\_CMD()} and
+\code{NOSH\_STR()}, which are the identity on the ESP32. The cost: with
+\code{help} alone about 1.9~KB of flash and the shell's stack plus a 64 byte line
+buffer in RAM; the four default commands add 3.3~KB on the AVR and 3.9~KB on the ESP32,
+measured per command in \code{nornInternal/nornSHELL/measurements.md}. Phase 2 of the
+module (\code{run}, \code{stop} and \code{wait} for the dynamic tasks of
+appendix~\ref{app:roadmap}, and a configuration store) is planned in its
+\code{nornInternal/nornSHELL/nosh-implementationsplan.md}.
+
+\section{Configuration that survives a reset: nornStore}
+\label{sec:nornstore}
+
+nornStore keeps a small set of typed configuration objects (a hostname, an address, a
+mode, a calibration) in RAM while the system runs and saves them as a whole to two
+blocks of non-volatile memory in turn: the last two sectors of the SPI flash on the
+ESP32, the two halves of the EEPROM on the AVR, through \code{hal/flash.h}. Every save
+erases the inactive block, writes the records, and writes the block header, with a
+sequence number and a CRC, last; a power failure at any point leaves the old image or
+the new one, never a mixture (the host test cuts the power after every single byte of
+a save and reboots the store each time). Like nosh it is an optional module on the
+public API: an application that does not call \code{store\_init} gets a kernel that is
+identical to the byte and no store code, which the same size check enforces.
+
+\begin{lstlisting}
+#include "store.h"
+#include "flash.h"
+
+enum { ID_HOSTNAME = 0x0101, ID_IP = 0x0201, ID_MODE = 0x0301 };
+static store_obj_t objs[] =                 /* id, type, room */
+{
+    STORE_OBJ(ID_HOSTNAME, STORE_STR, 32),
+    STORE_OBJ(ID_IP, STORE_IP4, 4),
+    STORE_OBJ(ID_MODE, STORE_U8, 1),
+};
+static uint8_t values[64];
+
+int main(void)
+{
+    rtos_init();
+    store_initHal(objs, 3, values, sizeof values);      /* nornCore's flash HAL as the driver */
+    store_defaultStr(ID_HOSTNAME, "norn-01");           /* first boot: the default; a saved value is kept */
+    ...                                                 /* create the tasks from the values */
+    rtos_start();
+}
+
+/* in a task, later */
+store_setU32(ID_MODE, 2);
+if(store_isDirty())
+    store_save();
+\end{lstlisting}
+
+The application owns everything that costs memory: the object table, the buffer the
+values live in, the driver, and the names. An object is a 16 bit id, a type
+(\code{STORE\_U8} to \code{STORE\_IP4}, \code{STORE\_STR}, \code{STORE\_BLOB}), a version
+byte the application interprets, and up to 255 bytes; records of ids the table does not
+know, or of another type, are ignored at load and vanish at the next save, so a table
+can grow and shrink between firmware versions. \code{store\_get} and \code{store\_set}
+work on the RAM image under a mutex and may be called from \code{main()} before
+\code{rtos\_start()}, where an application reads the configuration it creates its tasks
+from. \code{store\_save} is the one operation that touches the memory: on the ESP32 the
+flash cache is off and interrupts are masked while the ROM's flash routines run, which
+costs the tick for the tens of milliseconds a sector erase takes, so it is a maintenance
+operation, done when the device is not in a hurry; on the AVR the kernel keeps ticking
+and the calling task is busy for about 3.4~ms per byte written.
+
+With nosh in the build, \code{nosh\_add(\&store\_cmd\_config)} and a table of names
+(\code{store\_cmd\_setNames}) put the objects on the console:
+
+\begin{lstlisting}
+nosh> config
+system.hostname   str  norn-001
+network.ip        ip4  -
+nosh> config set network.ip 10.0.0.5
+network.ip        ip4  10.0.0.5 *
+nosh> config diff
+network.ip        - -> 10.0.0.5
+nosh> config save
+saved, seq 2 in block 1
+nosh> config info
+block 1 seq 2, image 52 of 4096 bytes, 3 objects, saved
+\end{lstlisting}
+
+(\code{get}, \code{set}, \code{diff} against the saved image, \code{save},
+\code{revert}, \code{erase yes}, \code{info}; objects by name or by \code{0xID}.) The
+command lives in nornStore and is compiled only when nosh is among the application's
+modules; nosh knows nothing of the store, and nornNET reads its address through a
+function the application supplies, never from the store directly, so the modules stay
+independent. \code{examples/store} in nornRTOS is the application above with the
+command; run twice on the same flash file in QEMU it shows the previous boot's values
+and a sequence number one higher. The cost: about 4.8~KB of flash on the ESP32 and
+5.5~KB on the AVR for the store, the same again for the \code{config} command and the
+parts of the API only it uses, measured per board in
+\code{nornInternal/nornStore/measurements.md}.
+
+\section{Trace}
+
+\code{RTOS\_CFG\_TRACE} calls \code{rtos\_traceHook(event, a, b)} at every context switch
+(the tasks leaving and entering), every block (task and wait kind), every wake-up, every
+timer expiry and every panic, with interrupts disabled. \code{hal/trace.h} is a ring
+buffer recorder to override the hook with, and the host unit tests are built on exactly
+this trace: each test compares the recorded sequence of (task, event, value) with the
+expected one.
